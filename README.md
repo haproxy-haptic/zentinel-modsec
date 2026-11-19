@@ -24,16 +24,50 @@
 </p>
 
 `zentinel-modsec` parses ModSecurity `.conf` rule files and evaluates them
-against requests and responses, with no C or C++ dependency and no FFI
-(`#![deny(unsafe_code)]`). SQL injection and XSS detection (`@detectSQLi`,
-`@detectXSS`) are a pure Rust port of libinjection. CRS compatibility is
-reported as a number, not asserted: CI runs the CRS regression corpus on every
-push and fails if the pass count changes (see [CRS conformance](#crs-conformance)).
+against requests and responses. The default build has no C or C++ dependency
+and no FFI (`#![deny(unsafe_code)]`). SQL injection and XSS detection
+(`@detectSQLi`, `@detectXSS`) use the Rust port of libinjection by default. The optional
+`libinjection-ffi` feature selects upstream C libinjection. CI checks individual CRS regression stages on both backends for pull requests and pushes to `main`.
+See [CRS conformance](#crs-conformance).
 
 It is the engine behind Zentinel's
 [ZentinelSec agent](https://registry.zentinelproxy.io/zentinelsec/). The
 [ModSecurity agent](https://github.com/zentinelproxy/zentinel-agent-modsec) is
 a different thing: it wraps the C++ libmodsecurity.
+
+### Optional upstream libinjection
+
+Enable `libinjection-ffi` to use upstream C libinjection v4.0.2 for
+`@detectSQLi`, `@detectXSS`, and the root `libinjection` API:
+
+```sh
+cargo build --features libinjection-ffi
+```
+
+This feature requires a C compiler, compiles the vendored BSD-3-Clause source
+locally, and adds no Go runtime or dynamic library dependency. The default
+remains pure Rust. The original Rust heuristic backend is also always available
+explicitly through `libinjection::sqli` and `libinjection::xss`; its detection
+semantics differ from upstream. Native parser errors are logged and reported
+as matches rather than silently allowing the input. Source provenance and the
+third-party license are in [vendor/libinjection](vendor/libinjection/README.md).
+
+The default backend uses `barbacane-libinjection` 0.1.3 and returns upstream-style
+SQL fingerprints and the `XSS` label for HTML matches. To compare both
+implementations on the v4.0.2 upstream data files, point `LIBINJECTION_DATA_DIR`
+at the upstream checkout’s `data` directory and run
+`cargo test --release --features libinjection-ffi --test libinjection_conformance upstream_dataset -- --ignored`.
+
+To compare per-call cost, run
+`cargo run --release --features libinjection-ffi --example libinjection_cost`.
+The example reports raw FFI, the selected API including result conversion,
+the Rust port, and the original heuristic. A standalone native C control is provided in
+`examples/libinjection_native_cost.c`; compile with `cc -O3 -Ivendor/libinjection
+examples/libinjection_native_cost.c vendor/libinjection/libinjection_sqli.c
+vendor/libinjection/libinjection_xss.c vendor/libinjection/libinjection_html5.c
+-o /tmp/libinjection-native-cost`. Alternate repeated runs on a quiet host:
+subtracting raw FFI and native C timings estimates crossing overhead but is
+sensitive to scheduling and clock noise.
 
 ## Quick start
 
@@ -104,15 +138,48 @@ tx.process_request_body()?;    // phase 2: the rule runs here
 assert!(tx.has_intervention());
 ```
 
-Request bodies need `SecRequestBodyAccess On`; feed them with
-`append_request_body()` before `process_request_body()`. Response phases are
-`process_response_headers()` and `process_response_body()`.
+Request and response body access default to Off, matching Coraza. Enable
+`SecRequestBodyAccess On` for request inspection. For response inspection also
+set `SecResponseBodyAccess On` and an explicit `SecResponseBodyMimeType` list;
+the bare MIME list is empty. Run header callbacks before feeding body chunks
+when possible, then finish with the corresponding body callback.
+
+`write_request_body()` and `write_response_body()` report how many bytes were
+retained for inspection. The caller still owns and forwards its original
+input. The `append_*` compatibility wrappers discard that count; all callers
+must check `intervention()` after writes. Writes are bounded before allocation.
+Request and response limits default to 134217728 and 524288 bytes, respectively;
+their actions default to Reject and ProcessPartial. Reaching a limit exactly
+also triggers its action. Reject does not copy the offending chunk and sets
+status 413 for requests or 500 for responses. ProcessPartial inspects only the
+prefix and sets `INBOUND_DATA_ERROR` or `OUTBOUND_DATA_ERROR`; it does not inspect
+the remaining tail. DetectionOnly uses ProcessPartial without interruption.
+
+A pre-header write retains at most a provisional prefix. Header `ctl` policy
+then resolves access and the pending limit decision; no body phase runs early.
+Each header/body phase executes at most once; failed callbacks remain errors
+on retries. After a body callback seals an ordinary body,
+new bytes produce a visible error; tails after a limit consume zero bytes.
+`status` applies to deny/block and drop actions. Redirects accept status
+301, 302, 303 or 307 and otherwise use 302, matching Coraza. A drop has
+`drop_connection=true` and status zero by default; check the intervention itself,
+not only a nonzero HTTP status. Status arguments retain the public `u16` domain.
+
+Response headers can be supplied with `process_response_headers_with_status()`;
+`process_response_body()` runs phase 4 after MIME/access checks.
+During raw response inspection, `RESPONSE_CONTENT_LENGTH` holds the byte count
+in phase 4, including zero for an empty body and the retained prefix length for
+`ProcessPartial`. It stays empty when inspection is skipped or the JSON response
+processor is selected.
 
 ### Detection only and anomaly scoring
 
 Under `SecRuleEngine DetectionOnly` rules match but never intervene;
 `tx.matched_rules()` lists what matched. `setvar` on `TX` works as in CRS, and
-`tx.anomaly_score()` returns the accumulated score:
+`tx.anomaly_score()` reads `TX:anomaly_score`. CRS versions with per-paranoia
+scores compute separate aggregates; read `TX:blocking_inbound_anomaly_score`
+through `tx.tx()` for the score used by inbound blocking. Rules own these
+variables, and phase completion preserves their values:
 
 ```rust
 let modsec = ModSecurity::from_string(r#"
@@ -133,6 +200,7 @@ let modsec = ModSecurity::from_string(r#"
 git clone https://github.com/coreruleset/coreruleset /etc/modsecurity/crs
 cp /etc/modsecurity/crs/crs-setup.conf.example /etc/modsecurity/crs/crs-setup.conf
 cat > /etc/modsecurity/main.conf <<'EOF'
+SecRequestBodyAccess On
 Include /etc/modsecurity/crs/crs-setup.conf
 Include /etc/modsecurity/crs/rules/*.conf
 EOF
@@ -158,9 +226,8 @@ async fn waf(
     tx.process_uri(uri, request.method().as_str(), "HTTP/1.1")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     for (name, value) in request.headers() {
-        if let Ok(v) = value.to_str() {
-            let _ = tx.add_request_header(name.as_str(), v);
-        }
+        tx.add_request_header_bytes(name.as_str().as_bytes(), value.as_bytes())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     tx.process_request_headers().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // Phase 2 (arguments; add the body first if you inspect bodies).
@@ -175,22 +242,126 @@ async fn waf(
 ## What is supported
 
 **Directives:** `SecRule`, `SecAction`, `SecMarker`, `SecRuleEngine`,
-`SecDefaultAction`, `SecRuleRemoveById`, `SecRuleUpdateTargetById`,
-`SecRuleUpdateActionById`, `SecRequestBodyAccess`, `SecResponseBodyAccess`,
-`SecRequestBodyLimit`, `SecResponseBodyLimit`, `Include`. Other directives are
-logged and skipped.
+`SecDefaultAction`, `SecRuleRemoveById`, `SecRuleRemoveByTag`,
+`SecRuleRemoveByMsg`, `SecRuleUpdateTargetById`,
+`SecRuleUpdateTargetByTag`, `Include`.
+Relative includes resolve beside their declaring file. A glob applies only to
+the written operand. An unmatched glob is allowed, and an unreadable matched
+file fails the load. As in Coraza 3.8.1, one configuration can expand up to
+100 `Include` directives, including nested directives. Each glob counts once.
+Body directives are implemented: `SecRequestBodyAccess`, `SecResponseBodyAccess`,
+`SecRequestBodyLimit`, `SecResponseBodyLimit`, their `LimitAction` settings,
+`SecResponseBodyMimeType` and `SecResponseBodyMimeTypesClear`. Limits must be
+between 1 byte and 1 GiB. MIME directives replace the list, matching the pinned
+reference implementation. `SecRequestBodyInMemoryLimit` sets the acquisition
+threshold. Larger request prefixes move to a private temporary file. A selected
+body processor reads the retained prefix into memory in phase 2. The threshold
+defaults to the request limit and must be positive and no larger than that limit.
+The standard Coraza build also leaves `SecRequestBodyNoFilesLimit` unenforced.
 
-**Operators:** `@rx`, `@pm`, `@pmf`, `@pmFromFile`, `@contains`, `@beginsWith`,
-`@endsWith`, `@streq`, `@within`, `@eq`, `@ne`, `@gt`, `@ge`, `@lt`, `@le`,
+
+`ctl:requestBodyLimit=N` selects a transaction's inspection threshold through
+phase 1. `ctl:responseBodyLimit=N` can run through phase 3. The last setting in
+time applies. Zero suppresses acquisition without a denial or data-error flag.
+Negative or unparseable limits produce an unsupported-control diagnostic.
+A positive threshold uses the configured `Reject` or `ProcessPartial` action
+at the exact byte limit. The configured storage ceiling still applies when a
+control raises the threshold. A write needing a larger buffer returns an error.
+
+Process headers before writing body bytes when rules change limits. Header
+processing reconciles a previously buffered prefix with the final threshold.
+If an increase requires bytes already discarded during provisional writes,
+the header callback returns an error and body inspection cannot resume.
+
+`SecRuleUpdateActionById 112 "deny,status:409"` updates an earlier rule or
+chain starter, including `SecAction`. Use an inclusive range to update several
+rules, for example `SecRuleUpdateActionById 100-120 "tag:catalog,setvar:tx.seen=+1"`.
+A range skips missing IDs. A singleton must exist and ends the selector list.
+Use a comma-separated action list without spaces. The last disruptive action,
+status, or message replaces its predecessor. Tags, transformations, and
+`setvar` actions accumulate in declaration order. Status uses an unsigned
+16-bit value. Updated actions have the same runtime support as rule actions.
+Other unknown directives warn at load. `SecComponentSignature` is accepted as metadata.
+
+`SecRuleUpdateTargetByTag attack-sqli "!ARGS:password"` excludes that argument
+from every rule carrying the exact, case-sensitive `attack-sqli` tag. Positive
+targets append to the rule; a third argument replaces an existing target, as
+with `SecRuleUpdateTargetById`. For a conditional transaction-local exclusion,
+use `ctl:ruleRemoveTargetByTag=attack-sqli;ARGS:password` on an earlier rule.
+Runtime exclusions also apply to children of a tagged chain starter. Both
+forms support regex collection keys such as `ARGS:/^token_/` (the runtime
+regex-key behavior follows Coraza 3.8.1). Invalid configure-time targets fail
+loading; malformed runtime controls produce load-time warnings with rule IDs.
+
+`ctl:ruleRemoveByTag=TAG` suppresses subsequent rules bearing the exact,
+case-sensitive tag for this transaction, including later phases. A tagged
+chain starter selects its entire chain. Untagged rules continue to execute.
+
+**Operators:** `@rx`, `@pm`, `@pmFromFile`, `@contains`, `@containsWord`, `@beginsWith`,
+`@endsWith`, `@within`, `@streq`, `@eq`, `@ne`, `@gt`, `@ge`, `@lt`, `@le`,
 `@detectSQLi`, `@detectXSS`, `@ipMatch`, `@ipMatchFromFile`,
 `@validateUrlEncoding`, `@validateUtf8Encoding`, `@validateByteRange`,
-`@unconditionalMatch`, `@noMatch`. `@containsWord` and `@strmatch` are
-approximated by `@contains`.
+`@unconditionalMatch`, `@noMatch`. The file-backed aliases `@pmf` and
+`@ipMatchF` read the same files as `@pmFromFile` and `@ipMatchFromFile`.
+`SecDataset` defines a case-sensitive name and a backtick-delimited list of
+records, one per line. `@pmFromDataset` treats each record as one phrase.
+`@ipMatchFromDataset` accepts comma-separated addresses or CIDRs per record
+and skips invalid entries. Rules bind to the definition in effect at their
+position, including across configuration reloads.
+
+`@restpath /orders/{id}` searches the inspected value for that route and
+stores the matched parameter in `ARGS_PATH:id`. A parameter ends at the next
+slash or question mark. `ARGS` and `ARGS_NAMES` include path parameters after
+query and body parameters. `ARGS_COMBINED_SIZE` counts the query and body.
+Connectors can call `add_path_argument` or `add_path_argument_bytes` before
+inspection. Each value counts toward the path collection’s `SecArgumentsLimit`.
+
+With `capture`, phrase matches populate `TX:0` through `TX:9` in input order
+using the original bytes. If phrases overlap, each capture takes the longest phrase at
+the next matching start, including starts inside an earlier match.
+
+`@containsWord` follows ModSecurity v3. It matches case-sensitive bytes bounded
+by the input edges or bytes outside ASCII A–Z and a–z. An empty operand matches
+every value. Coraza 3.8.1 does not implement this operator. `@strmatch` uses
+case-sensitive substring matching, including macro-expanded operands. Neither
+`@strmatch` nor `@geoLookup` writes capture slots. As in Coraza 3.8.1,
+`@geoLookup` always matches and leaves GEO empty.
+
+`@validateNid` accepts `cl` or `us` followed by a regular expression. It
+checks the first ten matching candidates and captures valid identifiers in the
+TX slots corresponding to their original positions.
+
+`@validateByteRange` accepts decimal bytes and inclusive ranges, for example
+`9,13,32-126`. Rules with an invalid static entry fail at load. A macro-supplied
+list is checked after expansion. An omitted range matches every input, including
+an empty value. A descending range contributes no permitted bytes.
+
+`@validateSchema schema.json` loads a JSON Schema once. The schema path is
+relative to the rule's directory, or the working directory for inline rules.
+References can address the same document or another file under that directory.
+External network retrieval is disabled. Invalid schemas or unresolved references
+fail rule loading. A schema violation or malformed nonempty JSON matches the
+operator. From phase 2 it prefers `TX:json_request_body`; from phase 4 it first
+checks `TX:json_response_body`. It falls back to the transformed rule target
+when neither applicable body is available. An empty fallback has no violation.
+The standard JSON Schema validator handles inputs below its 128-container nesting
+limit. For deeper inputs, the operator checks JSON syntax and numeric range
+through Coraza's 10,000-container limit. Finite schemas inspect the prefix they
+can observe. Recursive object and array schemas evaluate on a heap-backed graph
+that tracks references, conditional branches and evaluated properties or items.
+Local companion files, scoped dynamic anchors and recursive anchors use the
+dialect active at each referenced schema.
+
+A deeper input reports a violation when the graph cannot resolve a schema
+unambiguously. This includes reference cycles that never advance to a child,
+unknown dialects or explicit custom vocabularies, and configurations requiring
+more than 16,384 extra specializations for different dynamic anchor scopes.
 
 These parse but **never match**: `@verifyCC`, `@verifySSN`, `@verifyCPF`,
-`@validateHash`, `@validateDTD`, `@validateSchema`, `@rbl`, `@geoLookup`,
+`@validateHash`, `@validateDTD`, `@rbl`,
 `@gsbLookup`, `@inspectFile`, `@fuzzyHash`, `@rsub`. A rule that depends on one
-of them is inert.
+of them cannot perform the requested check; negating a placeholder can make
+it match. These operators produce load-time warnings with rule IDs.
 
 **Transformations:** `lowercase`, `uppercase`, `urlDecode`, `urlDecodeUni`,
 `urlEncode`, `base64Decode`, `base64DecodeExt`, `base64Encode`, `hexDecode`,
@@ -198,42 +369,136 @@ of them is inert.
 `escapeSeqDecode`, `utf8toUnicode`, `removeWhitespace`, `compressWhitespace`,
 `removeNulls`, `replaceNulls`, `trim`, `trimLeft`, `trimRight`,
 `normalizePath`, `normalizePathWin`, `removeComments`, `removeCommentsChar`,
-`replaceComments`, `cmdLine`, `md5`, `sha1`, `sha256`, `length`, `parityZero7bit`,
-`none`.
+`replaceComments`, `cmdLine`, `md5`, `sha1`, `sha256`, `length`, `none`.
+The three parity transformations are placeholders and warn with affected IDs.
+`t:urlEncode` preserves ASCII letters, digits and `*`, encodes a space as
+`+`, and uses lowercase percent escapes for other bytes. For example,
+`a *,` becomes `a+*%2c`. `t:urlDecode` reads a literal `+` as a space.
+
+A multipart rule or macro that reads `FILES_TMPNAMES` gets one temporary path
+per file part. The files contain the transfer-decoded bytes and are removed
+when the transaction is dropped. `SecUploadDir` selects an existing writable
+directory. It defaults to the system temporary directory. A ruleset that only
+reads ordinary upload metadata does not create named copies.
+
+Multipart fields, names and filenames retain their original bytes. The parser
+honors quoted parameters and extended filenames, preserves repeated parts, and
+reports malformed framing/header/parameter states through
+`MULTIPART_STRICT_ERROR`. Quoted-printable transfer encoding is decoded before
+inspection; other transfer encodings stay raw, as in Coraza's NextPart API. `FILES_SIZES` is keyed by filename;
+`FILES_COMBINED_SIZE` counts all multipart payload bytes (files and fields),
+excluding MIME framing, matching Coraza. Intentional `ProcessPartial` prefixes
+suppress only the EOF strict error, while other malformed states remain visible.
+
+Selecting `ctl:responseBodyProcessor=JSON` by phase 3 parses the inspected response
+in phase 4. Enable response body access and allow the response MIME type, or select
+`ctl:forceResponseBodyVariable=On` to bypass the MIME allowlist for a transaction.
+Setting this control to `Off` restores MIME filtering. The configured access and
+size limits still apply.
+`RESPONSE_ARGS` contains the flattened fields, including repeated names.
+The JSON processor writes the successful raw input to `TX:json_response_body`
+and leaves `RESPONSE_BODY` and `RESPONSE_CONTENT_LENGTH` empty.
+An error preserves fields already parsed and sets `RES_BODY_ERROR` and
+`RES_BODY_PROCESSOR_ERROR`; their `_MSG` counterparts expose the reason.
 
 **Body processors:** URL-encoded forms, multipart (including
-`MULTIPART_PART_HEADERS`), JSON and XML. XML is read with `quick-xml`, which
-does not expand entities. XPath is not supported: `XML:/*` and `XML://@*`
-(every `XML:` target in stock CRS) resolve against the flattened body, and
-richer XPath expressions are reported when the rules load.
+`MULTIPART_PART_HEADERS`), JSON, XML and explicit RAW. Missing or unknown body
+types remain unprocessed unless `ctl:forceRequestBodyVariable=On` selects the
+URLENCODED fallback used by Coraza 3.8.1. RAW exposes the body without form
+argument extraction. The engine also selects JSON and XML automatically from
+Content-Type. To use Coraza’s rule-controlled selection for these media types,
+call `engine.set_autodetect_structured_request_bodies(false)` before creating
+transactions. Explicit processor controls work in either mode. Only RAW and URLENCODED populate `REQUEST_BODY` and its
+length; structured processors leave these scalar values empty and zero.
 
-**Not implemented:** `UNIQUE_ID` and `FILES_COMBINED_SIZE`; rules that target
-only those are inert and reported at load time.
+The JSON processor preserves numeric token spelling and duplicate member values.
+It exposes each nonempty array's length at the array path alongside its indexed
+elements. Completed fields remain available when the processor reports an error.
+Flattened keys and values share a byte budget of eight times the acquired JSON
+size, with a 4 KiB minimum. `SecRequestBodyJsonDepthLimit` and
+`SecResponseBodyJsonDepthLimit` each default to 1,024 nested containers.
+A request exceeding its depth or byte budget sets `REQBODY_ERROR`.
+
+`SecArgumentsLimit` defaults to 1,000. Query and URL-encoded body arguments
+each have their own allowance, and repeated keys count once per value. The JSON
+processor counts scalar values and array lengths separately. Dropping an entry
+sets `ARGUMENTS_LIMIT_REACHED` for the rest of the transaction. Multipart field
+extraction follows Coraza's multipart processor, which does not apply this cap.
+
+XML values are stored separately from HTTP arguments. `XML:/*` selects text
+tokens and `XML://@*` selects attribute values, including namespace values.
+Element and attribute names do not become argument names. Streaming extraction
+handles empty elements, text split around entities, CDATA and truncated input
+without discarding text already inspected. The predefined XML and reference
+HTML4 entities are decoded, without using DTD definitions or resolving external
+resources. Suppressed custom entities remain literal and set `REQBODY_ERROR`;
+this deliberately retains stronger hidden-content reporting than Coraza's
+permissive parser. Bounds on depth and extracted values also report errors.
+General XPath is unsupported and produces load-time warnings with rule IDs.
+
+`UNIQUE_ID` exposes the connector ID passed to `new_transaction_with_id`, or a
+stable generated ID when none is supplied. CRS uses it for fractional sampling.
+
+Unsupported variables are
+reported at load even when a rule also selects implemented variables. Invalid
+selector/exclusion regexes and unsupported macro sources also warn with IDs.
+`setvar` requires a nonempty member of TX. The engine expands the value before interpreting signed integer addition or subtraction, and preserves the original bytes of plain assignments.
+
+`multiMatch` evaluates the original value and each changed transformation stage.
+Scalar macros such as `%{REQUEST_METHOD}` and `%{RESPONSE_STATUS}` read the
+transaction value in the current phase. A bare collection macro looks up the
+empty key, so `%{ARGS}` reads the first argument with an empty name if present.
+For supported keyed macros, a missing member expands to the name inside the
+braces, preserving its spelling. For example, an absent `%{Tx.Code}` expands
+to `Tx.Code`. An existing member with an empty value expands to an empty string.
+The byte APIs preserve binary input, captures and macro expansions; string APIs
+provide display values. Header lookup ignores ASCII case while match metadata
+preserves each original header name.
+
+With `SecRuleEngine On`, `allow:phase` ends the current phase and
+`allow:request` skips the remaining request rules. Response and logging
+rules still run after `allow:request`. Global `allow` skips all remaining
+rules, including logging rules, matching Coraza 3.8.1. In `DetectionOnly`,
+all three actions record the match and rule evaluation continues.
+
+Accepted action limitations are also reported with rule IDs:
+persistent-collection actions, script execution, response modification,
+`proxy`, `pause`, `xmlns`, and logging/sanitization policy.
+The engine has no log sink; embedding applications must implement logging
+policy. Known unsupported controls warn at load without repeating the warning
+on each request.
+
+Connectors can enable `Transaction::set_record_rule_messages(true)` and read
+`rule_messages()` for expanded `msg` and `logdata` bytes captured at match time.
+Recording is disabled by default. The connector applies logging policy and
+escapes these bytes for its output format. Supply actual response metadata via
+`process_response_headers_with_status` before processing its body.
 
 ## CRS conformance
 
-The OWASP CRS ships a regression suite of request/expectation pairs, each
-naming the rule IDs that must, or must not, appear in the log for a request.
-`tests/crs_conformance.rs` runs that corpus against this engine, and the CI
-`OWASP CRS conformance` job fails if the pass count differs from
-`MIN_PASSING` in either direction.
+The native runner checks the rule IDs listed in each regression stage under
+`tests/regression/tests` of CRS commit `30cb436` (4.31.0-dev). It reads 327
+YAML files, including one comment-only file. Of the 5,263 stages, 5,187 have
+structured input and rule-ID expectations. The other 76 use encoded requests
+or have no rule-ID assertion.
 
-| | |
-|---|---|
-| Corpus | CRS `main` (4.31.0-dev), pinned commit in `.github/workflows/ci.yml` |
-| Passing | **4,900 of 5,184 runnable cases (94.5%)** (`MIN_PASSING`) |
+On this pin both the default Rust port and `libinjection-ffi` pass the same
+5,096 of 5,187 executed stages. CI checks each backend against the shared manifest.
+[The reviewed outcome manifest](tests/fixtures/crs-native-outcomes.tsv)
+records each stage by file, test ID and stage number. A changed outcome,
+missing or new stage, fixture error, or incomplete engine callback fails CI.
+Set `CRS_STAGE_REPORT` to a new file path to save all observed outcomes.
 
 ```bash
 mkdir -p test-rules
 git clone https://github.com/coreruleset/coreruleset.git test-rules/crs
-git -C test-rules/crs checkout 30cb436   # the commit CI pins
+git -C test-rules/crs checkout 30cb436
 cp test-rules/crs/crs-setup.conf.example test-rules/crs/crs-setup.conf
 cargo test --release --test crs_conformance -- --nocapture
+cargo test --release --features libinjection-ffi --test crs_conformance -- --nocapture
 ```
 
-Against another CRS checkout the count differs from CI.
-
-### What that number does and does not tell you
+### Detection and blocking coverage
 
 The corpus runs in the configuration CRS documents for it: `DetectionOnly` at
 paranoia level 4. In that mode `block` never blocks, the paranoia gates never

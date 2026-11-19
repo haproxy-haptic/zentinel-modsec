@@ -35,6 +35,8 @@ pub enum VariableName {
     Args,
     /// `ARGS_GET`
     ArgsGet,
+    /// `ARGS_PATH`
+    ArgsPath,
     /// `ARGS_POST`
     ArgsPost,
     /// `ARGS_NAMES`
@@ -71,6 +73,12 @@ pub enum VariableName {
     RequestBody,
     /// `REQUEST_BODY_LENGTH`
     RequestBodyLength,
+    /// `ARGUMENTS_LIMIT_REACHED`
+    ArgumentsLimitReached,
+    /// `INBOUND_DATA_ERROR`
+    InboundDataError,
+    /// `OUTBOUND_DATA_ERROR`
+    OutboundDataError,
     /// `QUERY_STRING`
     QueryString,
 
@@ -83,6 +91,18 @@ pub enum VariableName {
     ResponseHeaders,
     /// `RESPONSE_HEADERS_NAMES`
     ResponseHeadersNames,
+    /// `RESPONSE_ARGS`
+    ResponseArgs,
+    /// `RES_BODY_PROCESSOR`
+    ResBodyProcessor,
+    /// `RES_BODY_ERROR`
+    ResBodyError,
+    /// `RES_BODY_ERROR_MSG`
+    ResBodyErrorMsg,
+    /// `RES_BODY_PROCESSOR_ERROR`
+    ResBodyProcessorError,
+    /// `RES_BODY_PROCESSOR_ERROR_MSG`
+    ResBodyProcessorErrorMsg,
     /// `RESPONSE_BODY`
     ResponseBody,
     /// `RESPONSE_CONTENT_TYPE`
@@ -203,6 +223,16 @@ pub enum VariableName {
     MultipartUnmatchedBoundary,
     /// `MULTIPART_PART_HEADERS`
     MultipartPartHeaders,
+    /// Multipart part names, keyed by part name.
+    MultipartName,
+    /// Primary and alternative multipart filenames.
+    MultipartFilename,
+    /// Extended filename charset.
+    MultipartFilenameCharset,
+    /// Extended filename language.
+    MultipartFilenameLanguage,
+    /// Duplicate header or conflicting parameter flag.
+    MultipartDuplicatePartHeader,
 
     // XML
     /// `XML`
@@ -241,17 +271,12 @@ pub enum VariableName {
     MultipartStrictCheck,
 }
 
-/// Which part of a flattened XML body an `XML:` selector refers to.
+/// Which XML value collection an `XML:` selector refers to.
 ///
-/// ModSecurity selects XML through XPath. This engine has no XPath evaluator
-/// and flattens XML bodies into `ARGS` instead, but the two selectors the OWASP
-/// CRS actually writes -- `XML:/*` for element content and `XML://@*` for
-/// attributes -- map onto that flattening exactly, and between them account for
-/// every `XML:` target in the stock rule set. Resolving those two costs nothing
-/// at request time and needs no XPath engine.
-///
-/// Anything else is genuinely unsupported and is reported when the rules load,
-/// rather than resolving to nothing and leaving the rule silently dead.
+/// The two selectors in the pinned CRS rules -- `XML:/*` for text and
+/// `XML://@*` for attribute values -- read dedicated XML collections, without
+/// introducing synthetic HTTP arguments or requiring a general XPath engine.
+/// Other XPath expressions are reported when rules load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XmlTarget {
     /// `XML:/*` -- element text.
@@ -292,6 +317,7 @@ impl VariableName {
             VariableName::Xml
             | VariableName::Args
             | VariableName::ArgsGet
+            | VariableName::ArgsPath
             | VariableName::ArgsPost
             | VariableName::ArgsNames
             | VariableName::ArgsGetNames
@@ -301,6 +327,17 @@ impl VariableName {
             | VariableName::RequestUriRaw
             | VariableName::RequestFilename
             | VariableName::RequestBasename
+            | VariableName::UniqueId
+            | VariableName::Time
+            | VariableName::TimeEpoch
+            | VariableName::TimeDay
+            | VariableName::TimeHour
+            | VariableName::TimeMin
+            | VariableName::TimeSec
+            | VariableName::TimeWday
+            | VariableName::TimeMon
+            | VariableName::TimeYear
+            | VariableName::Duration
             | VariableName::RequestLine
             | VariableName::RequestMethod
             | VariableName::RequestProtocol
@@ -310,11 +347,23 @@ impl VariableName {
             | VariableName::RequestCookiesNames
             | VariableName::RequestBody
             | VariableName::RequestBodyLength
+            | VariableName::ArgumentsLimitReached
+            | VariableName::InboundDataError
+            | VariableName::OutboundDataError
             | VariableName::QueryString
             | VariableName::ResponseStatus
+            | VariableName::ResponseProtocol
             | VariableName::ResponseHeaders
+            | VariableName::ResponseHeadersNames
+            | VariableName::ResponseArgs
+            | VariableName::ResBodyProcessor
+            | VariableName::ResBodyError
+            | VariableName::ResBodyErrorMsg
+            | VariableName::ResBodyProcessorError
+            | VariableName::ResBodyProcessorErrorMsg
             | VariableName::ResponseBody
             | VariableName::ResponseContentType
+            | VariableName::ResponseContentLength
             | VariableName::RemoteAddr
             | VariableName::RemotePort
             | VariableName::ServerAddr
@@ -327,6 +376,17 @@ impl VariableName {
             | VariableName::MatchedVarsNames
             | VariableName::Files
             | VariableName::FilesNames
+            | VariableName::FilesSizes
+            | VariableName::FilesTmpnames
+            | VariableName::FilesCombinedSize
+            | VariableName::MultipartStrictCheck
+            | VariableName::MultipartStrictError
+            | VariableName::MultipartInvalidQuoting
+            | VariableName::MultipartName
+            | VariableName::MultipartFilename
+            | VariableName::MultipartFilenameCharset
+            | VariableName::MultipartFilenameLanguage
+            | VariableName::MultipartDuplicatePartHeader
             | VariableName::MultipartPartHeaders
             | VariableName::ReqBodyProcessor
             | VariableName::ReqBodyError
@@ -334,10 +394,7 @@ impl VariableName {
             | VariableName::ReqBodyProcessorError
             | VariableName::ReqBodyProcessorErrorMsg => true,
 
-            VariableName::ResponseProtocol
-            | VariableName::ResponseHeadersNames
-            | VariableName::ResponseContentLength
-            | VariableName::RemoteHost
+            VariableName::RemoteHost
             | VariableName::RemoteUser
             | VariableName::Session
             | VariableName::Env
@@ -346,22 +403,8 @@ impl VariableName {
             | VariableName::Resource
             | VariableName::User
             | VariableName::Geo
-            | VariableName::Time
-            | VariableName::TimeEpoch
-            | VariableName::TimeDay
-            | VariableName::TimeHour
-            | VariableName::TimeMin
-            | VariableName::TimeSec
-            | VariableName::TimeWday
-            | VariableName::TimeMon
-            | VariableName::TimeYear
-            | VariableName::FilesSizes
-            | VariableName::FilesTmpnames
-            | VariableName::FilesCombinedSize
-            | VariableName::UniqueId
             | VariableName::InboundAnomalyScore
             | VariableName::OutboundAnomalyScore
-            | VariableName::Duration
             | VariableName::MultipartBoundaryQuoted
             | VariableName::MultipartBoundaryWhitespace
             | VariableName::MultipartDataAfter
@@ -370,25 +413,54 @@ impl VariableName {
             | VariableName::MultipartHeaderFolding
             | VariableName::MultipartInvalidHeaderFolding
             | VariableName::MultipartInvalidPart
-            | VariableName::MultipartInvalidQuoting
             | VariableName::MultipartLfLine
             | VariableName::MultipartMissingSemicolon
-            | VariableName::MultipartStrictError
             | VariableName::MultipartUnmatchedBoundary
             | VariableName::WebserverErrorLog
             | VariableName::HighestSeverity
             | VariableName::StatusLine
             | VariableName::FullRequest
             | VariableName::FullRequestLength
-            | VariableName::AuthType
-            | VariableName::MultipartStrictCheck => false,
+            | VariableName::AuthType => false,
         }
     }
 }
 
-/// Perfect hash map for O(1) variable name lookup.
-static VARIABLE_MAP: phf::Map<&'static str, VariableName> = phf_map! {
+// The parser and match-data reporting use the same SecLang spellings.
+macro_rules! variable_names {
+    ($($label:literal => VariableName::$variant:ident),* $(,)?) => {
+        static VARIABLE_MAP: phf::Map<&'static str, VariableName> = phf_map! {
+            $($label => VariableName::$variant),*
+        };
+        impl VariableName {
+            pub(crate) fn seclang_name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)*
+                    // Variants accessible through the typed API only.
+                    Self::InboundAnomalyScore => "INBOUND_ANOMALY_SCORE",
+                    Self::OutboundAnomalyScore => "OUTBOUND_ANOMALY_SCORE",
+                    Self::MultipartBoundaryQuoted => "MULTIPART_BOUNDARY_QUOTED",
+                    Self::MultipartBoundaryWhitespace => "MULTIPART_BOUNDARY_WHITESPACE",
+                    Self::MultipartDataAfter => "MULTIPART_DATA_AFTER",
+                    Self::MultipartDataBefore => "MULTIPART_DATA_BEFORE",
+                    Self::MultipartFileLimitExceeded => "MULTIPART_FILE_LIMIT_EXCEEDED",
+                    Self::MultipartHeaderFolding => "MULTIPART_HEADER_FOLDING",
+                    Self::MultipartInvalidHeaderFolding => "MULTIPART_INVALID_HEADER_FOLDING",
+                    Self::MultipartInvalidPart => "MULTIPART_INVALID_PART",
+                    Self::MultipartLfLine => "MULTIPART_LF_LINE",
+                    Self::MultipartMissingSemicolon => "MULTIPART_MISSING_SEMICOLON",
+                    Self::MultipartStrictError => "MULTIPART_STRICT_ERROR",
+                    Self::MultipartUnmatchedBoundary => "MULTIPART_UNMATCHED_BOUNDARY",
+                    Self::WebserverErrorLog => "WEBSERVER_ERROR_LOG",
+                }
+            }
+        }
+    };
+}
+
+variable_names! {
     "ARGS" => VariableName::Args,
+    "ARGS_PATH" => VariableName::ArgsPath,
     "ARGS_GET" => VariableName::ArgsGet,
     "ARGS_POST" => VariableName::ArgsPost,
     "ARGS_NAMES" => VariableName::ArgsNames,
@@ -408,11 +480,20 @@ static VARIABLE_MAP: phf::Map<&'static str, VariableName> = phf_map! {
     "REQUEST_COOKIES_NAMES" => VariableName::RequestCookiesNames,
     "REQUEST_BODY" => VariableName::RequestBody,
     "REQUEST_BODY_LENGTH" => VariableName::RequestBodyLength,
+    "ARGUMENTS_LIMIT_REACHED" => VariableName::ArgumentsLimitReached,
+    "INBOUND_DATA_ERROR" => VariableName::InboundDataError,
+    "OUTBOUND_DATA_ERROR" => VariableName::OutboundDataError,
     "QUERY_STRING" => VariableName::QueryString,
     "RESPONSE_STATUS" => VariableName::ResponseStatus,
     "RESPONSE_PROTOCOL" => VariableName::ResponseProtocol,
     "RESPONSE_HEADERS" => VariableName::ResponseHeaders,
     "RESPONSE_HEADERS_NAMES" => VariableName::ResponseHeadersNames,
+    "RESPONSE_ARGS" => VariableName::ResponseArgs,
+    "RES_BODY_PROCESSOR" => VariableName::ResBodyProcessor,
+    "RES_BODY_ERROR" => VariableName::ResBodyError,
+    "RES_BODY_ERROR_MSG" => VariableName::ResBodyErrorMsg,
+    "RES_BODY_PROCESSOR_ERROR" => VariableName::ResBodyProcessorError,
+    "RES_BODY_PROCESSOR_ERROR_MSG" => VariableName::ResBodyProcessorErrorMsg,
     "RESPONSE_BODY" => VariableName::ResponseBody,
     "RESPONSE_CONTENT_TYPE" => VariableName::ResponseContentType,
     "RESPONSE_CONTENT_LENGTH" => VariableName::ResponseContentLength,
@@ -464,7 +545,13 @@ static VARIABLE_MAP: phf::Map<&'static str, VariableName> = phf_map! {
     "REQBODY_PROCESSOR_ERROR_MSG" => VariableName::ReqBodyProcessorErrorMsg,
     "MULTIPART_STRICT_ERROR" => VariableName::MultipartStrictCheck,
     "MULTIPART_PART_HEADERS" => VariableName::MultipartPartHeaders,
-};
+    "MULTIPART_NAME" => VariableName::MultipartName,
+    "MULTIPART_FILENAME" => VariableName::MultipartFilename,
+    "MULTIPART_FILENAME_CHARSET" => VariableName::MultipartFilenameCharset,
+    "MULTIPART_FILENAME_LANGUAGE" => VariableName::MultipartFilenameLanguage,
+    "MULTIPART_DUPLICATE_PART_HEADER" => VariableName::MultipartDuplicatePartHeader,
+    "MULTIPART_INVALID_QUOTING" => VariableName::MultipartInvalidQuoting,
+}
 
 impl VariableName {
     /// Parse a variable name from a string (O(1) lookup).
@@ -495,12 +582,14 @@ impl VariableName {
             self,
             Self::Args
                 | Self::ArgsGet
+                | Self::ArgsPath
                 | Self::ArgsPost
                 | Self::ArgsNames
                 | Self::RequestHeaders
                 | Self::RequestHeadersNames
                 | Self::RequestCookies
                 | Self::RequestCookiesNames
+                | Self::ResponseArgs
                 | Self::ResponseHeaders
                 | Self::ResponseHeadersNames
                 | Self::Tx
@@ -518,6 +607,10 @@ impl VariableName {
                 | Self::FilesTmpnames
                 | Self::FilesNames
                 | Self::MultipartPartHeaders
+                | Self::MultipartName
+                | Self::MultipartFilename
+                | Self::MultipartFilenameCharset
+                | Self::MultipartFilenameLanguage
         )
     }
 }

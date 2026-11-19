@@ -1,21 +1,10 @@
-//! `XML:` rule targets, resolved against the flattened XML body.
-//!
-//! ModSecurity selects XML through XPath. This engine has no XPath evaluator
-//! and flattens XML bodies into `ARGS` instead — which already covers stock
-//! CRS, because 175 of the 176 CRS rules naming an `XML:` target also name
-//! `ARGS` in the same rule. But a rule targeting `XML:` *alone* used to resolve
-//! to nothing and match nothing, with no complaint at load time, and that is
-//! the failure mode this engine should never have.
-//!
-//! The two selectors CRS actually writes — `XML:/*` (177 occurrences) and
-//! `XML://@*` (176) — are exactly the element-text and attribute halves of the
-//! flattening, so they need no XPath engine. Anything richer is reported when
-//! the rules load rather than silently matching nothing.
+//! XML values use the two selector collections implemented by Coraza 3.8.1.
+//! They are independent of ARGS and never require a general XPath evaluator.
 
 use zentinel_modsec::ModSecurity;
 
 fn blocks(rules: &str, body: &[u8]) -> bool {
-    let m = ModSecurity::from_string(rules).expect("rules load");
+    let m = load_with_request_body(rules).expect("rules load");
     let mut tx = m.new_transaction();
     tx.process_uri("/api", "POST", "HTTP/1.1").unwrap();
     tx.add_request_header("Content-Type", "application/xml")
@@ -110,7 +99,7 @@ fn benign_xml_matches_nothing() {
 
 #[test]
 fn an_xml_target_is_empty_when_the_body_is_not_xml() {
-    let m = ModSecurity::from_string(
+    let m = load_with_request_body(
         "SecRuleEngine On\nSecRule XML:/* \"@detectSQLi\" \"id:1,phase:2,deny\"",
     )
     .unwrap();
@@ -131,7 +120,7 @@ fn an_xml_target_is_empty_when_the_body_is_not_xml() {
 
 #[test]
 fn the_stock_crs_target_list_still_works() {
-    // 175 of 176 CRS rules naming XML: also name ARGS. Both halves must fire.
+    // XML values must remain inspected even though they are not HTTP arguments.
     let rule = "SecRuleEngine On\n\
         SecRule ARGS|ARGS_NAMES|XML:/*|XML://@* \"@detectSQLi\" \"id:942100,phase:2,deny\"";
     assert!(blocks(rule, format!("<o><q>{SQLI}</q></o>").as_bytes()));
@@ -155,7 +144,7 @@ fn an_unsupported_xpath_expression_still_loads_the_ruleset() {
             "SecRuleEngine On\nSecRule {target} \"@detectSQLi\" \"id:1,phase:2,deny\"\n\
                      SecRule ARGS \"@detectSQLi\" \"id:2,phase:2,deny\""
         );
-        let m = ModSecurity::from_string(&rules)
+        let m = load_with_request_body(&rules)
             .unwrap_or_else(|e| panic!("{target} should still load: {e}"));
         assert_eq!(m.rule_count(), 2, "{target}");
     }
@@ -185,4 +174,10 @@ fn xml_target_selection_is_classified() {
         XmlTarget::from_selection(Some(&Selection::Key("/order/item".into()))),
         None
     );
+}
+
+// These positive body fixtures explicitly request inspection; the engine's
+// bare defaults match Coraza and leave body access off.
+fn load_with_request_body(config: &str) -> zentinel_modsec::Result<ModSecurity> {
+    ModSecurity::from_string(&format!("SecRequestBodyAccess On\n{config}"))
 }

@@ -1,19 +1,30 @@
 //! Operator implementations for ModSecurity.
 
+mod byte_argument;
+pub(crate) use byte_argument::compile_bound_operator;
+pub use byte_argument::compile_operator_bytes;
 mod comparison;
 mod detection;
+mod national_id;
 mod network;
 mod pattern;
+mod restpath;
+pub(crate) mod schema;
 mod traits;
 mod validation;
 
 pub use comparison::{BeginsWithOperator, ContainsOperator, EndsWithOperator, StreqOperator};
-pub use comparison::{EqOperator, GeOperator, GtOperator, LeOperator, LtOperator};
+pub use comparison::{
+    EqOperator, GeOperator, GtOperator, LeOperator, LtOperator, NumericComparison,
+};
 pub use detection::{DetectSqliOperator, DetectXssOperator};
 pub use network::IpMatchOperator;
+pub(crate) use pattern::{token_byte, RegexOptions};
 pub use pattern::{PmOperator, RxOperator};
-pub use traits::{Operator, OperatorResult};
-pub use validation::{ValidateUrlEncodingOperator, ValidateUtf8EncodingOperator};
+pub use traits::{ByteOperatorResult, Operator, OperatorResult};
+pub use validation::{
+    ValidateByteRangeOperator, ValidateUrlEncodingOperator, ValidateUtf8EncodingOperator,
+};
 
 use crate::error::Result;
 use crate::parser::{OperatorName, OperatorSpec};
@@ -35,13 +46,39 @@ pub fn create_operator(name: OperatorName, argument: &str) -> Result<Arc<dyn Ope
 
 /// Create a compiled operator from a specification.
 pub fn compile_operator(spec: &OperatorSpec) -> Result<Arc<dyn Operator>> {
+    compile_with_dataset(spec, None, RegexOptions::default())
+}
+
+pub(crate) fn compile_with_dataset(
+    spec: &OperatorSpec,
+    dataset: Option<&[String]>,
+    regex: RegexOptions,
+) -> Result<Arc<dyn Operator>> {
     let name = &spec.name;
     let argument = &spec.argument;
     match name {
-        OperatorName::Rx => Ok(Arc::new(RxOperator::new(argument)?)),
-        OperatorName::Pm | OperatorName::Pmf => Ok(Arc::new(PmOperator::new(argument)?)),
-        OperatorName::PmFromFile => Ok(Arc::new(PmOperator::from_file(argument)?)),
+        OperatorName::PmFromDataset | OperatorName::IpMatchFromDataset => {
+            let records = dataset
+                .filter(|rows| *name == OperatorName::PmFromDataset || !rows.is_empty())
+                .ok_or_else(|| crate::Error::Config {
+                    message: format!("dataset {argument:?} not found"),
+                })?;
+            if *name == OperatorName::PmFromDataset {
+                Ok(Arc::new(PmOperator::from_dataset(records)?))
+            } else {
+                Ok(Arc::new(IpMatchOperator::from_dataset(records)))
+            }
+        }
+        OperatorName::RestPath => Ok(Arc::new(restpath::RestPath::new(argument)?)),
+        OperatorName::Rx => Ok(Arc::new(RxOperator::with_options(argument, regex)?)),
+        OperatorName::Pm => Ok(Arc::new(PmOperator::new(argument)?)),
+        OperatorName::PmFromFile | OperatorName::Pmf => {
+            Ok(Arc::new(PmOperator::from_file(argument)?))
+        }
         OperatorName::Contains => Ok(Arc::new(ContainsOperator::new(argument))),
+        OperatorName::ContainsWord => Ok(Arc::new(comparison::ContainsWordOperator::new(
+            argument.as_bytes(),
+        ))),
         OperatorName::BeginsWith => Ok(Arc::new(BeginsWithOperator::new(argument))),
         OperatorName::EndsWith => Ok(Arc::new(EndsWithOperator::new(argument))),
         OperatorName::StreQ => Ok(Arc::new(StreqOperator::new(argument))),
@@ -54,27 +91,31 @@ pub fn compile_operator(spec: &OperatorSpec) -> Result<Arc<dyn Operator>> {
         OperatorName::DetectXss => Ok(Arc::new(DetectXssOperator)),
         OperatorName::ValidateUrlEncoding => Ok(Arc::new(ValidateUrlEncodingOperator)),
         OperatorName::ValidateUtf8Encoding => Ok(Arc::new(ValidateUtf8EncodingOperator)),
-        OperatorName::IpMatch | OperatorName::IpMatchF => {
-            Ok(Arc::new(IpMatchOperator::new(argument)?))
+        OperatorName::IpMatch => Ok(Arc::new(IpMatchOperator::new(argument)?)),
+        OperatorName::IpMatchFromFile | OperatorName::IpMatchF => {
+            Ok(Arc::new(IpMatchOperator::from_file(argument)?))
         }
-        OperatorName::IpMatchFromFile => Ok(Arc::new(IpMatchOperator::from_file(argument)?)),
         OperatorName::NoMatch => Ok(Arc::new(NoMatchOperator)),
-        OperatorName::UnconditionalMatch => Ok(Arc::new(UnconditionalMatchOperator)),
-        OperatorName::ValidateByteRange => Ok(Arc::new(ValidateByteRangeOperator::new(argument))),
+        OperatorName::GeoLookup | OperatorName::UnconditionalMatch => {
+            Ok(Arc::new(UnconditionalMatchOperator))
+        }
+        OperatorName::ValidateByteRange => {
+            Ok(Arc::new(ValidateByteRangeOperator::try_new(argument)?))
+        }
         // Placeholder operators - acknowledge but don't match
         OperatorName::VerifyCc | OperatorName::VerifySsn | OperatorName::VerifyCpf => {
             Ok(Arc::new(NoMatchOperator))
         }
-        OperatorName::ValidateHash | OperatorName::ValidateDtd | OperatorName::ValidateSchema => {
-            Ok(Arc::new(NoMatchOperator))
-        }
-        OperatorName::Rbl | OperatorName::GeoLookup | OperatorName::GsbLookup => {
-            Ok(Arc::new(NoMatchOperator))
-        }
+        OperatorName::ValidateNid => Ok(Arc::new(national_id::NationalId::new(argument)?)),
+        OperatorName::ValidateSchema => Ok(Arc::new(schema::SchemaOperator::load(
+            argument,
+            std::path::Path::new("."),
+        )?)),
+        OperatorName::ValidateHash | OperatorName::ValidateDtd => Ok(Arc::new(NoMatchOperator)),
+        OperatorName::Rbl | OperatorName::GsbLookup => Ok(Arc::new(NoMatchOperator)),
         OperatorName::InspectFile | OperatorName::FuzzyHash | OperatorName::Rsub => {
             Ok(Arc::new(NoMatchOperator))
         }
-        OperatorName::ContainsWord => Ok(Arc::new(ContainsOperator::new(argument))),
         OperatorName::Within => Ok(Arc::new(WithinOperator::new(argument))),
         OperatorName::StrMatch => Ok(Arc::new(ContainsOperator::new(argument))),
         OperatorName::Ne => Ok(Arc::new(NeOperator::new(argument))),
@@ -85,6 +126,10 @@ pub fn compile_operator(spec: &OperatorSpec) -> Result<Arc<dyn Operator>> {
 pub struct NoMatchOperator;
 
 impl Operator for NoMatchOperator {
+    fn execute_bytes(&self, _value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(ByteOperatorResult::no_match())
+    }
+
     fn execute(&self, _value: &str) -> OperatorResult {
         OperatorResult::no_match()
     }
@@ -98,6 +143,10 @@ impl Operator for NoMatchOperator {
 pub struct UnconditionalMatchOperator;
 
 impl Operator for UnconditionalMatchOperator {
+    fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(ByteOperatorResult::matched(value.to_vec()))
+    }
+
     fn execute(&self, value: &str) -> OperatorResult {
         OperatorResult::matched(value.to_string())
     }
@@ -107,72 +156,35 @@ impl Operator for UnconditionalMatchOperator {
     }
 }
 
-/// Validates that all bytes are within specified ranges.
-pub struct ValidateByteRangeOperator {
-    #[allow(dead_code)]
-    ranges: Vec<(u8, u8)>,
-}
-
-impl ValidateByteRangeOperator {
-    /// Create a new byte range validator.
-    pub fn new(spec: &str) -> Self {
-        // Parse ranges like "9,10,13,32-126"
-        let mut ranges = Vec::new();
-        for part in spec.split(',') {
-            let part = part.trim();
-            if part.contains('-') {
-                let parts: Vec<&str> = part.split('-').collect();
-                if parts.len() == 2 {
-                    if let (Ok(start), Ok(end)) = (parts[0].parse(), parts[1].parse()) {
-                        ranges.push((start, end));
-                    }
-                }
-            } else if let Ok(byte) = part.parse() {
-                ranges.push((byte, byte));
-            }
-        }
-        Self { ranges }
-    }
-}
-
-impl Operator for ValidateByteRangeOperator {
-    fn execute(&self, value: &str) -> OperatorResult {
-        // Check if all bytes are within the allowed ranges
-        for byte in value.bytes() {
-            let valid = self
-                .ranges
-                .iter()
-                .any(|(start, end)| byte >= *start && byte <= *end);
-            if !valid {
-                // Invalid byte found - this is a match (rule should trigger)
-                return OperatorResult::matched(format!("invalid byte: {}", byte));
-            }
-        }
-        OperatorResult::no_match()
-    }
-
-    fn name(&self) -> &'static str {
-        "validateByteRange"
-    }
-}
-
-/// Within operator - checks if value is within a list of values.
+/// Tests whether the argument contains the input as a byte substring.
 pub struct WithinOperator {
-    values: Vec<String>,
+    haystack: Vec<u8>,
 }
 
 impl WithinOperator {
     /// Create a new within operator.
     pub fn new(values: &str) -> Self {
         Self {
-            values: values.split_whitespace().map(|s| s.to_string()).collect(),
+            haystack: values.as_bytes().to_vec(),
         }
+    }
+
+    pub(crate) fn matches(haystack: &[u8], needle: &[u8]) -> bool {
+        memchr::memmem::find(haystack, needle).is_some()
     }
 }
 
 impl Operator for WithinOperator {
+    fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(if Self::matches(&self.haystack, value) {
+            ByteOperatorResult::matched(value.to_vec())
+        } else {
+            ByteOperatorResult::no_match()
+        })
+    }
+
     fn execute(&self, value: &str) -> OperatorResult {
-        if self.values.iter().any(|v| v == value) {
+        if Self::matches(&self.haystack, value.as_bytes()) {
             OperatorResult::matched(value.to_string())
         } else {
             OperatorResult::no_match()
@@ -199,6 +211,13 @@ impl NeOperator {
 }
 
 impl Operator for NeOperator {
+    fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(match std::str::from_utf8(value) {
+            Ok(text) => self.execute(text).into(),
+            Err(_) => ByteOperatorResult::matched(value.to_vec()),
+        })
+    }
+
     fn execute(&self, value: &str) -> OperatorResult {
         // Try numeric comparison first
         if let (Ok(a), Ok(b)) = (value.parse::<i64>(), self.expected.parse::<i64>()) {

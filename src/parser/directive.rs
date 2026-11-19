@@ -4,6 +4,15 @@ use super::{Action, OperatorSpec, VariableSpec};
 use crate::error::SourceLocation;
 use std::path::PathBuf;
 
+/// Policy when an acquired body reaches its configured inspection limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyLimitAction {
+    /// Stop the transaction without copying the offending chunk.
+    Reject,
+    /// Inspect only the bounded prefix and let the connector retain the tail.
+    ProcessPartial,
+}
+
 /// A parsed ModSecurity directive.
 #[derive(Debug, Clone)]
 pub enum Directive {
@@ -15,12 +24,22 @@ pub enum Directive {
     SecMarker(SecMarker),
     /// SecRuleEngine directive - enable/disable rules.
     SecRuleEngine(RuleEngineMode),
+    /// Named records available to subsequent dataset operators.
+    SecDataset(String, Vec<String>),
     /// SecDefaultAction directive - default actions for rules.
     SecDefaultAction(Vec<Action>),
+    /// Component name and version recorded in audit logs.
+    SecComponentSignature(String),
     /// SecRuleRemoveById directive - remove rules by ID or ID range.
     SecRuleRemoveById(Vec<RuleIdSelector>),
+    /// Remove previously declared rules carrying this exact tag.
+    SecRuleRemoveByTag(String),
+    /// Remove previously declared rules with this exact message.
+    SecRuleRemoveByMsg(String),
     /// SecRuleUpdateTargetById directive - update rule targets (CRS exclusions).
     SecRuleUpdateTargetById(UpdateTargetById),
+    /// SecRuleUpdateTargetByTag directive - update targets for an exact tag.
+    SecRuleUpdateTargetByTag(UpdateTargetByTag),
     /// SecRuleUpdateActionById directive - update rule actions.
     SecRuleUpdateActionById {
         /// ID of the rule whose actions are being amended.
@@ -28,14 +47,42 @@ pub enum Directive {
         /// Actions to merge into that rule.
         actions: Vec<Action>,
     },
+    /// Ordered rule ID ranges or singletons for an action update.
+    SecRuleUpdateActionByIdRanges {
+        /// Selectors in directive order.
+        selectors: Vec<RuleIdSelector>,
+        /// Actions applied to each selected rule.
+        actions: Vec<Action>,
+    },
+    /// Select literal prefiltering for subsequent regular expressions.
+    SecRxPreFilter(bool),
+
     /// SecRequestBodyAccess directive.
     SecRequestBodyAccess(bool),
     /// SecResponseBodyAccess directive.
     SecResponseBodyAccess(bool),
+    /// Maximum number of parsed arguments in a collection.
+    SecArgumentsLimit(usize),
+    /// Maximum nesting of request JSON containers.
+    SecRequestBodyJsonDepthLimit(usize),
+    /// Maximum nesting of response JSON containers.
+    SecResponseBodyJsonDepthLimit(usize),
+    /// SecRequestBodyInMemoryLimit directive.
+    SecRequestBodyInMemoryLimit(usize),
     /// SecRequestBodyLimit directive.
     SecRequestBodyLimit(usize),
     /// SecResponseBodyLimit directive.
     SecResponseBodyLimit(usize),
+    /// SecRequestBodyLimitAction directive.
+    SecRequestBodyLimitAction(BodyLimitAction),
+    /// SecResponseBodyLimitAction directive.
+    SecResponseBodyLimitAction(BodyLimitAction),
+    /// Directory for temporary uploaded files.
+    SecUploadDir(std::path::PathBuf),
+    /// SecResponseBodyMimeType directive (replaces the configured list).
+    SecResponseBodyMimeType(Vec<String>),
+    /// SecResponseBodyMimeTypesClear directive.
+    SecResponseBodyMimeTypesClear,
     /// Include directive - include another file.
     Include(PathBuf),
     /// Unknown directive (logged and skipped).
@@ -83,6 +130,16 @@ pub struct UpdateTargetById {
     pub replaced: Option<String>,
     /// Source location for diagnostics.
     pub location: SourceLocation,
+}
+
+/// A target update selected by an exact, case-sensitive rule tag.
+#[derive(Debug, Clone)]
+pub struct UpdateTargetByTag {
+    /// Rule tag to select.
+    pub tag: String,
+    /// Target update, using the same append/exclude/replace semantics as by ID.
+    /// Its ID selectors are empty because selection is by tag.
+    pub targets: UpdateTargetById,
 }
 
 /// A SecRule directive.

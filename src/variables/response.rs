@@ -2,6 +2,24 @@
 
 use super::collection::HashMapCollection;
 
+/// Fields produced by the JSON response body processor.
+#[derive(Debug, Clone)]
+pub struct ResponseJson {
+    /// Flattened response fields, with repeated values preserved.
+    pub args: HashMapCollection,
+    /// The processor error, if any. Successfully parsed fields remain available.
+    pub error: Option<String>,
+}
+
+impl Default for ResponseJson {
+    fn default() -> Self {
+        Self {
+            args: HashMapCollection::named(),
+            error: None,
+        }
+    }
+}
+
 /// Response data container.
 #[derive(Debug, Clone, Default)]
 pub struct ResponseData {
@@ -13,6 +31,12 @@ pub struct ResponseData {
     pub headers: HashMapCollection,
     /// Response body.
     pub body: Vec<u8>,
+    /// Acquisition reached the configured response body limit.
+    pub outbound_data_error: bool,
+    /// Body bytes were made available to phase 4 under the MIME/access policy.
+    pub body_inspected: bool,
+    /// Present once a rule selects the JSON processor.
+    pub json: Option<Box<ResponseJson>>,
     /// Content type.
     pub content_type: String,
 }
@@ -35,12 +59,24 @@ impl ResponseData {
 
     /// Add a response header.
     pub fn add_header(&mut self, name: &str, value: &str) {
-        self.headers.add(name.to_lowercase(), value.to_string());
+        self.add_header_bytes(name.as_bytes(), value.as_bytes());
+    }
 
-        // Track content-type
-        if name.eq_ignore_ascii_case("content-type") {
-            self.content_type = value.to_string();
+    /// Add original response bytes, retaining each header name separately from
+    /// its normalized lookup key.
+    pub fn add_header_bytes(&mut self, name: &[u8], value: &[u8]) {
+        self.headers
+            .add_named_bytes(name.to_ascii_lowercase(), name, value);
+        if name.eq_ignore_ascii_case(b"content-type") {
+            self.content_type = super::ByteValue::from(media_type(value)).to_string();
         }
+    }
+
+    /// Media type from the last received Content-Type, before parameters.
+    pub fn content_type_bytes(&self) -> &[u8] {
+        self.headers
+            .last_value_bytes(b"content-type")
+            .map_or_else(|| self.content_type.as_bytes(), media_type)
     }
 
     /// Append to response body.
@@ -57,4 +93,17 @@ impl ResponseData {
     pub fn body_length(&self) -> usize {
         self.body.len()
     }
+
+    /// Bytes visible through RESPONSE_BODY after its phase's access checks.
+    pub fn body_variable_bytes(&self) -> &[u8] {
+        if self.body_inspected && self.json.is_none() {
+            &self.body
+        } else {
+            b""
+        }
+    }
+}
+
+fn media_type(value: &[u8]) -> &[u8] {
+    value.split(|&byte| byte == b';').next().unwrap_or_default()
 }

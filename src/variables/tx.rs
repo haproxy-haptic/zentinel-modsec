@@ -1,6 +1,8 @@
 //! TX (transaction) collection.
 
-use super::collection::{Collection, HashMapCollection, MutableCollection};
+use super::collection::{ByteCollection, Collection, MutableCollection};
+use super::{folded_key, ByteValue, MemberSelector};
+use indexmap::IndexMap;
 use regex::Regex;
 use std::borrow::Cow;
 
@@ -11,76 +13,284 @@ use std::borrow::Cow;
 /// `TX:BLOCKING_PARANOIA_LEVEL`, and its anomaly scoring never accumulates if
 /// those are treated as two different keys. Normalising here rather than at the
 /// call sites keeps the guarantee in one place -- every read and write in the
-/// engine goes through this type -- and leaves case-sensitive collections such
-/// as `ARGS` untouched.
+/// engine goes through this type.
 #[derive(Debug, Clone, Default)]
 pub struct TxCollection {
-    data: HashMapCollection,
-}
-
-/// Lowercase a key only when it actually contains uppercase, so the common path
-/// (CRS writes and reads lowercase) does not allocate.
-fn normalize(key: &str) -> Cow<'_, str> {
-    if key.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(key.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(key)
-    }
+    data: IndexMap<ByteValue, ByteValue>,
+    // Upper bound on occupied single-digit keys, including values written by callers.
+    capture_limit: u8,
 }
 
 impl TxCollection {
+    pub(crate) fn visit(&self, selector: &MemberSelector, mut emit: impl FnMut(&[u8], &[u8])) {
+        match selector {
+            MemberSelector::Key(key) => {
+                if let Some(value) = self.canonical_value(key) {
+                    emit(key, value);
+                }
+            }
+            MemberSelector::All => {
+                for (key, value) in &self.data {
+                    emit(key.as_bytes(), value.as_bytes());
+                }
+            }
+            MemberSelector::Regex(Some(pattern)) | MemberSelector::TxAsciiPrefix(pattern) => {
+                let prefix = matches!(selector, MemberSelector::TxAsciiPrefix(_))
+                    .then(|| &pattern.as_str().as_bytes()[1..]);
+                for (key, value) in &self.data {
+                    let key = key.as_bytes();
+                    // TX keys are already folded; Unicode prefixes still use
+                    // the original regex for its Unicode case-fold classes.
+                    let matched = prefix
+                        .and_then(|literal| {
+                            let head = key.get(..literal.len()).unwrap_or(key);
+                            head.is_ascii().then(|| head == literal)
+                        })
+                        .unwrap_or_else(|| pattern.is_match(key));
+                    if matched {
+                        emit(key, value.as_bytes());
+                    }
+                }
+            }
+            MemberSelector::Regex(None) => (),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub(crate) fn apply_defaults(&mut self, values: &[(ByteValue, ByteValue)], capture_limit: u8) {
+        self.data.extend(values.iter().cloned());
+        self.capture_limit = self.capture_limit.max(capture_limit);
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<&ByteValue> {
+        self.data.get(folded_key(key).as_ref())
+    }
+
+    /// Look up a literal key already canonicalized by the rule compiler.
+    pub(crate) fn canonical_value(&self, key: &[u8]) -> Option<&[u8]> {
+        self.data.get(key).map(ByteValue::as_bytes)
+    }
+
+    /// A position from an earlier lookup is usable only while it still names
+    /// this key. Deletes can shift entries and callers can replace the collection.
+    pub(crate) fn indexed_value(&self, key: &[u8], index: &mut usize) -> Option<&[u8]> {
+        if let Some((stored, value)) = self.data.get_index(*index) {
+            if stored.as_bytes() == key {
+                return Some(value.as_bytes());
+            }
+        }
+        let (found, _, value) = self.data.get_full(key)?;
+        *index = found;
+        Some(value.as_bytes())
+    }
+
+    pub(crate) fn first_value_bytes(&self, key: &[u8]) -> Option<&[u8]> {
+        self.lookup(key).map(ByteValue::as_bytes)
+    }
+
     /// Create a new TX collection.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Store original value bytes under a case-insensitive original byte key.
+    pub fn set_bytes(&mut self, key: impl Into<ByteValue>, value: impl Into<ByteValue>) {
+        let key = key.into();
+
+        let key = match folded_key(key.as_bytes()) {
+            Cow::Borrowed(_) => key,
+            Cow::Owned(folded) => folded.into(),
+        };
+        self.set_canonical(key, value.into());
+    }
+
+    pub(crate) fn set_canonical(&mut self, key: ByteValue, value: ByteValue) {
+        self.observe_capture_key(key.as_bytes());
+        self.data.insert(key, value);
+    }
+
+    /// Delete a case-insensitive original byte key.
+    pub fn delete_bytes(&mut self, key: &[u8]) {
+        self.delete_canonical(&folded_key(key));
+    }
+
+    pub(crate) fn delete_canonical(&mut self, key: &[u8]) {
+        self.data.shift_remove(key);
+    }
+
+    /// Increment a numeric byte value with signed 64-bit wrapping, matching
+    /// Coraza on 64-bit targets. A nonnumeric value starts at zero.
+    pub fn increment_bytes(&mut self, key: &[u8], amount: i64) {
+        self.increment_canonical(ByteValue::from(folded_key(key)), amount, true);
+    }
+
+    pub(crate) fn increment_canonical(
+        &mut self,
+        key: ByteValue,
+        amount: i64,
+        reset_invalid: bool,
+    ) -> bool {
+        self.observe_capture_key(key.as_bytes());
+        match self.data.entry(key) {
+            indexmap::map::Entry::Occupied(mut entry) => {
+                let value = entry.get();
+                let current = if value.as_bytes().is_empty() {
+                    Some(0)
+                } else {
+                    value.as_utf8().ok().and_then(|s| s.parse::<i64>().ok())
+                };
+                if current.is_none() && !reset_invalid {
+                    return false;
+                }
+                entry.insert(ByteValue::decimal(
+                    current.unwrap_or(0).wrapping_add(amount),
+                ));
+            }
+            indexmap::map::Entry::Vacant(entry) => {
+                entry.insert(ByteValue::decimal(amount));
+            }
+        }
+        true
+    }
+
+    fn observe_capture_key(&mut self, key: &[u8]) {
+        self.capture_limit = self.capture_limit.max(Self::capture_slot_end(key));
+    }
+
+    pub(crate) fn capture_slot_end(key: &[u8]) -> u8 {
+        match key {
+            [digit @ b'0'..=b'9'] => digit - b'0' + 1,
+            _ => 0,
+        }
+    }
+
+    /// Replace TX:0..TX:9 with the whole match and its first nine groups.
+    /// Clear previously occupied slots even when the new match has fewer groups.
+    pub(crate) fn replace_captures(&mut self, whole: Option<ByteValue>, groups: Vec<Vec<u8>>) {
+        for slot in 0..std::mem::take(&mut self.capture_limit) {
+            self.data.shift_remove(&[b'0' + slot][..]);
+        }
+        if let Some(whole) = whole {
+            self.set_bytes("0", whole);
+        }
+        for (&slot, group) in ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+            .iter()
+            .zip(groups)
+        {
+            self.set_bytes(slot, group);
+        }
+    }
+
     /// Clear all data.
     pub fn clear(&mut self) {
         self.data.clear();
+        self.capture_limit = 0;
     }
 }
 
 impl Collection for TxCollection {
     fn all(&self) -> Vec<(&str, &str)> {
-        self.data.all()
+        self.data
+            .iter()
+            .map(|(key, value)| (key.display_text(), value.display_text()))
+            .collect()
     }
 
     fn get(&self, key: &str) -> Option<Vec<&str>> {
-        self.data.get(&normalize(key))
+        self.lookup(key.as_bytes()).map(|v| vec![v.display_text()])
     }
 
-    /// Regex selection (`TX:/^foo/`) matches against the stored, lowercased
-    /// key, so a pattern anchored on uppercase will not match.
     fn get_regex(&self, pattern: &Regex) -> Vec<(&str, &str)> {
-        self.data.get_regex(pattern)
+        self.data
+            .iter()
+            .filter(|(key, _)| pattern.is_match(key.display_text()))
+            .map(|(key, value)| (key.display_text(), value.display_text()))
+            .collect()
     }
 
     fn count(&self) -> usize {
-        self.data.count()
+        self.data.len()
     }
 
     fn count_key(&self, key: &str) -> usize {
-        self.data.count_key(&normalize(key))
+        usize::from(self.lookup(key.as_bytes()).is_some())
     }
 }
 
 impl MutableCollection for TxCollection {
     fn set(&mut self, key: String, value: String) {
-        match normalize(&key) {
-            Cow::Borrowed(_) => self.data.set(key, value),
-            Cow::Owned(lower) => self.data.set(lower, value),
-        }
+        self.set_bytes(key, value);
     }
 
     fn delete(&mut self, key: &str) {
-        self.data.delete(&normalize(key));
+        self.delete_bytes(key.as_bytes());
     }
 
     fn increment(&mut self, key: &str, amount: i64) {
-        self.data.increment(&normalize(key), amount);
+        self.increment_bytes(key.as_bytes(), amount);
     }
 
     fn decrement(&mut self, key: &str, amount: i64) {
-        self.data.decrement(&normalize(key), amount);
+        self.increment(key, amount.wrapping_neg());
+    }
+}
+
+impl ByteCollection for TxCollection {
+    fn all_bytes(&self) -> Vec<(&[u8], &[u8])> {
+        self.data
+            .iter()
+            .map(|(key, value)| (key.as_bytes(), value.as_bytes()))
+            .collect()
+    }
+
+    fn get_bytes(&self, key: &[u8]) -> Option<Vec<&[u8]>> {
+        self.first_value_bytes(key).map(|v| vec![v])
+    }
+
+    fn get_regex_bytes(&self, pattern: &regex::bytes::Regex) -> Vec<(&[u8], &[u8])> {
+        self.data
+            .iter()
+            .filter(|(key, _)| pattern.is_match(key.as_bytes()))
+            .map(|(key, value)| (key.as_bytes(), value.as_bytes()))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_single_variable;
+    use crate::variables::{SelectorPrograms, TargetSelection};
+
+    #[test]
+    fn literal_prefix_visits_match_the_regex_for_folded_and_opaque_keys() {
+        let mut tx = TxCollection::new();
+        for key in ["s", "S_K", "ſ_key", "Key", "1", "header_name", "a."] {
+            tx.set_bytes(key, key);
+        }
+        for key in [b"s_\xff".as_slice(), b"\xffheader", b"he\xffader", b""] {
+            tx.set_bytes(key, key);
+        }
+        for pattern in [
+            "^header_", "^s_", "^s", "^k", "^1", "^", "^S", "^a[.]", "^a|s",
+        ] {
+            let spec = parse_single_variable(&format!("TX:/{pattern}/")).unwrap();
+            let mut programs = SelectorPrograms::default();
+            let re = programs.add(pattern, spec.name).unwrap().clone();
+            let selection = TargetSelection::compile(&spec, &programs);
+            let direct = tx
+                .get_regex_bytes(&re)
+                .into_iter()
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect::<Vec<_>>();
+            let mut visited = Vec::new();
+            tx.visit(&selection.member, |k, v| {
+                visited.push((k.to_vec(), v.to_vec()));
+            });
+            assert_eq!(visited, direct, "{pattern}");
+        }
     }
 }

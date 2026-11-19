@@ -50,6 +50,85 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Read a directive whose full argument is one literal, including unquoted spaces.
+    pub(super) fn remaining_argument(&mut self) -> String {
+        let text = self.raw_remaining_argument();
+        text.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(&text)
+            .to_owned()
+    }
+
+    pub(super) fn raw_remaining_argument(&mut self) -> String {
+        let mut text = String::new();
+        let mut continued = false;
+        loop {
+            let mut line = String::new();
+            while self.peek().is_some_and(|ch| ch != '\n') {
+                line.push(self.advance().unwrap());
+            }
+            let line = line.trim();
+            if !continued || !(line.is_empty() || line.starts_with('#')) {
+                if let Some(prefix) = line.strip_suffix('\\') {
+                    text.push_str(prefix);
+                    continued = true;
+                } else {
+                    text.push_str(line);
+                    break;
+                }
+            }
+            if self.advance().is_none() {
+                break;
+            }
+        }
+        text
+    }
+
+    /// A trailing backtick opens a line-oriented block. Blank and comment
+    /// lines are skipped; spaces within a record are part of the record.
+    pub(super) fn dataset(&mut self) -> Result<(String, Vec<String>), &'static str> {
+        let mut text = self.input_line().trim().to_owned();
+        if text.ends_with('`') {
+            loop {
+                if self.peek().is_none() {
+                    return Err("SecDataset backticks left open");
+                }
+                let line = self.input_line();
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                text.push('\n');
+                text.push_str(line);
+                if line.starts_with('`') {
+                    break;
+                }
+            }
+        }
+        let (name, records) = text
+            .split_once(' ')
+            .ok_or("SecDataset requires a name and records")?;
+        let records = records
+            .trim_matches('`')
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        Ok((name.to_owned(), records))
+    }
+
+    fn input_line(&mut self) -> String {
+        let mut line = String::new();
+        while let Some(c) = self.advance() {
+            if c == '\n' {
+                break;
+            }
+            line.push(c);
+        }
+        line
+    }
+
     /// Peek at the next character without consuming it.
     pub fn peek(&mut self) -> Option<char> {
         self.input.peek().copied()
@@ -77,10 +156,9 @@ impl<'a> Lexer<'a> {
     pub fn skip_whitespace(&mut self) {
         loop {
             match self.input.peek() {
-                // '\r' is whitespace too: a CRLF file would otherwise stop the
-                // token stream at the first line end and silently drop every
-                // directive after it.
-                Some(&' ') | Some(&'\t') | Some(&'\r') => {
+                // read_word stops at Unicode whitespace. Consume the same set
+                // of separators here, leaving line endings for next_token.
+                Some(&c) if c != '\n' && c.is_whitespace() => {
                     self.advance();
                 }
                 Some(&'\\') => {
@@ -160,15 +238,6 @@ impl<'a> Lexer<'a> {
                     line,
                     column,
                 })
-            }
-            '\\' => {
-                // Line continuation (LF or CRLF)
-                self.advance();
-                self.skip_cr_before_lf();
-                if self.peek() == Some('\n') {
-                    self.advance();
-                }
-                self.next_token()
             }
             _ => {
                 // Capture at_line_start BEFORE reading the word (since advance() will set it to false)

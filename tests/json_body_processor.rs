@@ -17,7 +17,7 @@
 use zentinel_modsec::ModSecurity;
 
 fn run(rules: &str, content_type: &str, body: &[u8]) -> bool {
-    let msc = ModSecurity::from_string(rules).expect("rules should load");
+    let msc = load_with_request_body(rules).expect("rules should load");
     let mut tx = msc.new_transaction();
     tx.process_uri("/api/search", "POST", "HTTP/1.1").unwrap();
     if !content_type.is_empty() {
@@ -239,25 +239,23 @@ fn a_malformed_body_does_not_abort_the_transaction() {
     assert!(run(rules, "application/json", br#"{bad"#));
 }
 
-/// A body can be small on the wire and expand into an enormous number of
-/// arguments. Hitting the cap is reported as a processing error rather than
-/// silently truncating, because a partially inspected body is not a safe one.
 #[test]
-fn exceeding_the_argument_cap_is_reported_as_an_error() {
-    let crs_200002 = "SecRuleEngine On\n\
-         SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400\"";
-
-    let huge = format!("[{}]", vec!["1"; 5000].join(","));
-    assert!(
-        run(crs_200002, "application/json", huge.as_bytes()),
-        "a body past the argument cap must set REQBODY_ERROR"
-    );
+fn exceeding_the_argument_cap_sets_the_limit_flag_on_valid_json() {
+    let body = format!("[{}]", vec!["1"; 1001].join(","));
+    assert!(run(
+        r#"SecRule ARGUMENTS_LIMIT_REACHED "@eq 1" "id:301,phase:2,deny""#,
+        "application/json",
+        body.as_bytes()
+    ));
+    assert!(!run(
+        r#"SecRule REQBODY_ERROR "@eq 1" "id:302,phase:2,deny""#,
+        "application/json",
+        body.as_bytes()
+    ));
 }
 
 #[test]
 fn deeply_nested_json_does_not_overflow_the_stack() {
-    // serde_json refuses to parse past its own recursion limit, so this is
-    // reported as a parse error rather than crashing.
     let crs_200002 = "SecRuleEngine On\n\
          SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400\"";
 
@@ -276,7 +274,8 @@ fn an_empty_body_is_not_a_parse_error() {
     let crs_200002 = "SecRuleEngine On\n\
          SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400\"";
     assert!(!run(crs_200002, "application/json", b""));
-    assert!(!run(crs_200002, "application/json", b"   \n\t "));
+    // With bytes present the JSON processor runs. Whitespace alone is invalid.
+    assert!(run(crs_200002, "application/json", b"   \n\t "));
 }
 
 /// Duplicate keys must not hide a payload.
@@ -340,4 +339,64 @@ fn excluding_one_json_path_leaves_the_others_live() {
         ),
         "a different key must still be inspected"
     );
+}
+
+// These positive body fixtures explicitly request inspection; the engine's
+// bare defaults match Coraza and leave body access off.
+fn load_with_request_body(config: &str) -> zentinel_modsec::Result<ModSecurity> {
+    ModSecurity::from_string(&format!("SecRequestBodyAccess On\n{config}"))
+}
+
+#[test]
+fn reference_array_lengths_numbers_and_duplicate_order() {
+    use zentinel_modsec::variables::{Collection, RequestData};
+    let mut req = RequestData::new();
+    req.append_body(br#"{"rate":1.50,"rate":1E+4,"tags":[1,2],"empty":[]}"#);
+    req.parse_json_body().unwrap();
+    assert_eq!(req.args_post.get("json.rate").unwrap(), ["1.50", "1E+4"]);
+    assert_eq!(req.args_post.get("json.tags").unwrap(), ["2"]);
+    assert_eq!(req.args_post.get("json.tags.1").unwrap(), ["2"]);
+    assert_eq!(req.args_post.get("json.empty"), None);
+    let mut req = RequestData::new();
+    req.append_body(b"1.50");
+    req.parse_json_body().unwrap();
+    assert_eq!(req.args_post.get("json.0").unwrap(), ["1.50"]);
+    assert_eq!(req.args_post.get("json").unwrap(), ["1"]);
+}
+
+#[test]
+fn completed_fields_survive_errors() {
+    use zentinel_modsec::variables::{Collection, RequestData};
+    for body in [br#"{"good":1,"more":"#.as_slice(), br#"{"good":1}x"#] {
+        let mut req = RequestData::new();
+        req.append_body(body);
+        assert!(req.parse_json_body().is_err());
+        assert_eq!(req.args_post.get("json.good").unwrap(), ["1"]);
+    }
+    let mut req = RequestData::new();
+    req.append_body(br#"{"arr":[1,2"#);
+    assert!(req.parse_json_body().is_err());
+    assert_eq!(req.args_post.get("json.arr").unwrap(), ["2"]);
+}
+
+#[test]
+fn array_metadata_shares_the_reference_expanded_byte_budget() {
+    use zentinel_modsec::variables::{Collection, RequestData};
+    let body = format!("{}0{}", "[".repeat(64), "]".repeat(64));
+    let mut req = RequestData::new();
+    req.append_body(body.as_bytes());
+    assert!(req.parse_json_body().unwrap_err().contains("byte budget"));
+    assert_eq!(req.args_post.count(), 47);
+}
+
+#[test]
+fn array_field_name_is_visible_through_args_names() {
+    let rules = r#"SecRuleEngine On
+SecRule ARGS_NAMES "@streq json.labels" "id:101,phase:2,deny""#;
+    assert!(run(
+        rules,
+        "application/json",
+        br#"{"labels":["north","south"]}"#
+    ));
+    assert!(!run(rules, "application/json", br#"{"labels":[]}"#));
 }
