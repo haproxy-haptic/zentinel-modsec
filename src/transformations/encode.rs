@@ -7,6 +7,10 @@ use std::borrow::Cow;
 pub struct Base64Encode;
 
 impl Transformation for Base64Encode {
+    fn transform_bytes<'a>(&self, input: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
+        super::bytes::apply(self, input)
+    }
+
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
         use base64::Engine;
         Cow::Owned(base64::engine::general_purpose::STANDARD.encode(input))
@@ -21,6 +25,10 @@ impl Transformation for Base64Encode {
 pub struct HexEncode;
 
 impl Transformation for HexEncode {
+    fn transform_bytes<'a>(&self, input: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
+        super::bytes::apply(self, input)
+    }
+
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
         let encoded: String = input.bytes().map(|b| format!("{:02x}", b)).collect();
         Cow::Owned(encoded)
@@ -34,15 +42,40 @@ impl Transformation for HexEncode {
 /// URL encode transformation.
 pub struct UrlEncode;
 
-impl Transformation for UrlEncode {
-    fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
-        let encoded = utf8_percent_encode(input, NON_ALPHANUMERIC).to_string();
-        if encoded == input {
-            Cow::Borrowed(input)
-        } else {
-            Cow::Owned(encoded)
+impl UrlEncode {
+    fn encode(input: &[u8]) -> Option<String> {
+        let literal = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'*';
+        if input.iter().all(|&byte| literal(byte)) {
+            return None;
         }
+
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(input.len());
+        for &byte in input {
+            match byte {
+                b' ' => encoded.push('+'),
+                byte if literal(byte) => encoded.push(char::from(byte)),
+                byte => {
+                    encoded.push('%');
+                    encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                    encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                }
+            }
+        }
+        Some(encoded)
+    }
+}
+
+impl Transformation for UrlEncode {
+    fn transform_bytes<'a>(&self, input: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
+        Ok(match Self::encode(input) {
+            Some(text) => Cow::Owned(text.into_bytes()),
+            None => Cow::Borrowed(input),
+        })
+    }
+
+    fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
+        Self::encode(input.as_bytes()).map_or(Cow::Borrowed(input), Cow::Owned)
     }
 
     fn name(&self) -> &'static str {
@@ -54,6 +87,10 @@ impl Transformation for UrlEncode {
 pub struct Md5;
 
 impl Transformation for Md5 {
+    fn transform_bytes<'a>(&self, input: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
+        super::bytes::apply(self, input)
+    }
+
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
         use md5::{Digest, Md5 as Md5Hasher};
         let mut hasher = Md5Hasher::new();
@@ -71,6 +108,10 @@ impl Transformation for Md5 {
 pub struct Sha1;
 
 impl Transformation for Sha1 {
+    fn transform_bytes<'a>(&self, input: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
+        super::bytes::apply(self, input)
+    }
+
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
         use sha1::{Digest, Sha1 as Sha1Hasher};
         let mut hasher = Sha1Hasher::new();

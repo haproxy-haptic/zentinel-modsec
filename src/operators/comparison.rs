@@ -1,6 +1,6 @@
 //! Comparison operators (@contains, @eq, @gt, etc.).
 
-use super::traits::{Operator, OperatorResult};
+use super::traits::{ByteOperatorResult, Operator, OperatorResult};
 
 /// Contains operator (@contains).
 pub struct ContainsOperator {
@@ -17,6 +17,16 @@ impl ContainsOperator {
 }
 
 impl Operator for ContainsOperator {
+    fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(
+            if memchr::memmem::find(value, self.needle.as_bytes()).is_some() {
+                ByteOperatorResult::matched(self.needle.as_bytes().to_vec())
+            } else {
+                ByteOperatorResult::no_match()
+            },
+        )
+    }
+
     fn execute(&self, value: &str) -> OperatorResult {
         if value.contains(&self.needle) {
             OperatorResult::matched(self.needle.clone())
@@ -27,6 +37,53 @@ impl Operator for ContainsOperator {
 
     fn name(&self) -> &'static str {
         "contains"
+    }
+}
+
+/// Case-sensitive `@containsWord` with ModSecurity v3's ASCII-letter boundaries.
+pub(super) struct ContainsWordOperator {
+    finder: memchr::memmem::Finder<'static>,
+}
+
+impl ContainsWordOperator {
+    pub(super) fn new(needle: &[u8]) -> Self {
+        Self {
+            finder: memchr::memmem::Finder::new(needle).into_owned(),
+        }
+    }
+
+    fn find(&self, value: &[u8]) -> ByteOperatorResult {
+        let needle = self.finder.needle();
+        if needle.is_empty() {
+            return ByteOperatorResult::matched(Vec::new());
+        }
+        let mut start = 0;
+        while let Some(offset) = self.finder.find(&value[start..]) {
+            let pos = start + offset;
+            let end = pos + needle.len();
+            if (pos == 0 || !value[pos - 1].is_ascii_alphabetic())
+                && (end == value.len() || !value[end].is_ascii_alphabetic())
+            {
+                return ByteOperatorResult::matched(needle);
+            }
+            // The next acceptable occurrence may overlap this rejected one.
+            start = pos + 1;
+        }
+        ByteOperatorResult::no_match()
+    }
+}
+
+impl Operator for ContainsWordOperator {
+    fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(self.find(value))
+    }
+
+    fn execute(&self, value: &str) -> OperatorResult {
+        self.find(value.as_bytes()).into_text()
+    }
+
+    fn name(&self) -> &'static str {
+        "containsWord"
     }
 }
 
@@ -45,6 +102,14 @@ impl BeginsWithOperator {
 }
 
 impl Operator for BeginsWithOperator {
+    fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(if value.starts_with(self.prefix.as_bytes()) {
+            ByteOperatorResult::matched(self.prefix.as_bytes().to_vec())
+        } else {
+            ByteOperatorResult::no_match()
+        })
+    }
+
     fn execute(&self, value: &str) -> OperatorResult {
         if value.starts_with(&self.prefix) {
             OperatorResult::matched(self.prefix.clone())
@@ -73,6 +138,14 @@ impl EndsWithOperator {
 }
 
 impl Operator for EndsWithOperator {
+    fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(if value.ends_with(self.suffix.as_bytes()) {
+            ByteOperatorResult::matched(self.suffix.as_bytes().to_vec())
+        } else {
+            ByteOperatorResult::no_match()
+        })
+    }
+
     fn execute(&self, value: &str) -> OperatorResult {
         if value.ends_with(&self.suffix) {
             OperatorResult::matched(self.suffix.clone())
@@ -101,6 +174,14 @@ impl StreqOperator {
 }
 
 impl Operator for StreqOperator {
+    fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+        Ok(if value == self.expected.as_bytes() {
+            ByteOperatorResult::matched(value.to_vec())
+        } else {
+            ByteOperatorResult::no_match()
+        })
+    }
+
     fn execute(&self, value: &str) -> OperatorResult {
         if value == self.expected {
             OperatorResult::matched(value.to_string())
@@ -114,200 +195,126 @@ impl Operator for StreqOperator {
     }
 }
 
-/// Numeric equals operator (@eq).
-/// Supports both numeric literals and variable references (e.g., %{tx.var}).
-pub struct EqOperator {
-    /// The argument (may be a number or variable reference).
-    arg: String,
+// Pinned Coraza's numeric operators use strconv.Atoi and ignore its error.
+// Syntax errors become zero; signed 64-bit overflows retain the clamped value.
+// Work on original bytes: invalid UTF-8 is a syntax error, not absent input.
+fn numeric_value(bytes: &[u8]) -> i64 {
+    if let [byte] = bytes {
+        let digit = byte.wrapping_sub(b'0');
+        return if digit < 10 { i64::from(digit) } else { 0 };
+    }
+    let (negative, digits) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    let saturated = if negative { i64::MIN } else { i64::MAX };
+    let mut value = 0u64;
+    for &byte in digits {
+        if !byte.is_ascii_digit() {
+            return 0;
+        }
+        let Some(next) = value
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(byte - b'0')))
+        else {
+            // strconv.ParseUint returns immediately on unsigned overflow,
+            // even if later bytes would have been invalid syntax.
+            return saturated;
+        };
+        value = next;
+    }
+    if negative {
+        if value >= 1u64 << 63 {
+            i64::MIN
+        } else {
+            -(value as i64)
+        }
+    } else {
+        value.min(i64::MAX as u64) as i64
+    }
 }
 
-impl EqOperator {
-    /// Create the operator from its SecLang argument.
-    pub fn new(value: &str) -> Self {
-        Self {
-            arg: value.to_string(),
-        }
-    }
+/// A built-in numeric comparison with an immutable, already parsed operand.
+#[derive(Clone, Copy, Debug)]
+pub struct NumericComparison {
+    target: i64,
+    compare: fn(i64, i64) -> bool,
+}
 
-    fn target_value(&self) -> Option<i64> {
-        // If it's a variable reference, we can't resolve it statically
-        if self.arg.contains("%{") {
-            return None;
-        }
-        self.arg.parse().ok()
+impl NumericComparison {
+    /// Test an input with the same signed byte conversion as the numeric operators.
+    pub fn matches(self, value: &[u8]) -> bool {
+        (self.compare)(numeric_value(value), self.target)
     }
 }
 
-impl Operator for EqOperator {
-    fn execute(&self, value: &str) -> OperatorResult {
-        if let Some(target) = self.target_value() {
-            if let Ok(n) = value.parse::<i64>() {
-                if n == target {
-                    return OperatorResult::matched(value.to_string());
+// A numeric target is parsed once. Values and expanded arguments use the
+// same original-byte conversion, including Go's overflow behavior.
+macro_rules! numeric_operator {
+    ($operator:ident, $name:literal, $comparison:tt) => {
+        #[doc = concat!("Numeric comparison operator (@", $name, ").")]
+        pub struct $operator {
+            target: Option<i64>,
+        }
+
+        impl $operator {
+            /// Compile a static argument. Runtime macros are bound by the transaction.
+            pub fn new(argument: &str) -> Self {
+                Self {
+                    target: (!argument.contains("%{")).then(|| numeric_value(argument.as_bytes())),
                 }
             }
-        }
-        // For variable references, comparison would need runtime resolution
-        // For now, we don't match if we can't resolve
-        OperatorResult::no_match()
-    }
 
-    fn name(&self) -> &'static str {
-        "eq"
-    }
-}
+            pub(super) fn from_expanded(argument: &[u8]) -> Self {
+                Self { target: Some(numeric_value(argument)) }
+            }
 
-/// Greater than operator (@gt).
-pub struct GtOperator {
-    arg: String,
-}
+            fn compare(left: i64, right: i64) -> bool {
+                left $comparison right
+            }
 
-impl GtOperator {
-    /// Create the operator from its SecLang argument.
-    pub fn new(value: &str) -> Self {
-        Self {
-            arg: value.to_string(),
-        }
-    }
-
-    fn target_value(&self) -> Option<i64> {
-        if self.arg.contains("%{") {
-            return None;
-        }
-        self.arg.parse().ok()
-    }
-}
-
-impl Operator for GtOperator {
-    fn execute(&self, value: &str) -> OperatorResult {
-        if let Some(target) = self.target_value() {
-            if let Ok(n) = value.parse::<i64>() {
-                if n > target {
-                    return OperatorResult::matched(value.to_string());
-                }
+            fn matches(&self, value: &[u8]) -> bool {
+                self.target.is_some_and(|target| Self::compare(numeric_value(value), target))
             }
         }
-        OperatorResult::no_match()
-    }
 
-    fn name(&self) -> &'static str {
-        "gt"
-    }
-}
+        impl Operator for $operator {
+            fn numeric_comparison(&self) -> Option<NumericComparison> {
+                self.target.map(|target| NumericComparison {
+                    target,
+                    compare: Self::compare,
+                })
+            }
 
-/// Less than operator (@lt).
-pub struct LtOperator {
-    arg: String,
-}
+            fn execute_bytes(&self, value: &[u8]) -> crate::Result<ByteOperatorResult> {
+                Ok(if self.matches(value) {
+                    ByteOperatorResult::matched(value.to_vec())
+                } else {
+                    ByteOperatorResult::no_match()
+                })
+            }
 
-impl LtOperator {
-    /// Create the operator from its SecLang argument.
-    pub fn new(value: &str) -> Self {
-        Self {
-            arg: value.to_string(),
-        }
-    }
-
-    fn target_value(&self) -> Option<i64> {
-        if self.arg.contains("%{") {
-            return None;
-        }
-        self.arg.parse().ok()
-    }
-}
-
-impl Operator for LtOperator {
-    fn execute(&self, value: &str) -> OperatorResult {
-        if let Some(target) = self.target_value() {
-            if let Ok(n) = value.parse::<i64>() {
-                if n < target {
-                    return OperatorResult::matched(value.to_string());
+            fn execute(&self, value: &str) -> OperatorResult {
+                if self.matches(value.as_bytes()) {
+                    OperatorResult::matched(value.to_owned())
+                } else {
+                    OperatorResult::no_match()
                 }
             }
-        }
-        OperatorResult::no_match()
-    }
 
-    fn name(&self) -> &'static str {
-        "lt"
-    }
-}
-
-/// Greater than or equal operator (@ge).
-pub struct GeOperator {
-    arg: String,
-}
-
-impl GeOperator {
-    /// Create the operator from its SecLang argument.
-    pub fn new(value: &str) -> Self {
-        Self {
-            arg: value.to_string(),
-        }
-    }
-
-    fn target_value(&self) -> Option<i64> {
-        if self.arg.contains("%{") {
-            return None;
-        }
-        self.arg.parse().ok()
-    }
-}
-
-impl Operator for GeOperator {
-    fn execute(&self, value: &str) -> OperatorResult {
-        if let Some(target) = self.target_value() {
-            if let Ok(n) = value.parse::<i64>() {
-                if n >= target {
-                    return OperatorResult::matched(value.to_string());
-                }
+            fn name(&self) -> &'static str {
+                $name
             }
         }
-        OperatorResult::no_match()
-    }
-
-    fn name(&self) -> &'static str {
-        "ge"
-    }
+    };
 }
 
-/// Less than or equal operator (@le).
-pub struct LeOperator {
-    arg: String,
-}
-
-impl LeOperator {
-    /// Create the operator from its SecLang argument.
-    pub fn new(value: &str) -> Self {
-        Self {
-            arg: value.to_string(),
-        }
-    }
-
-    fn target_value(&self) -> Option<i64> {
-        if self.arg.contains("%{") {
-            return None;
-        }
-        self.arg.parse().ok()
-    }
-}
-
-impl Operator for LeOperator {
-    fn execute(&self, value: &str) -> OperatorResult {
-        if let Some(target) = self.target_value() {
-            if let Ok(n) = value.parse::<i64>() {
-                if n <= target {
-                    return OperatorResult::matched(value.to_string());
-                }
-            }
-        }
-        OperatorResult::no_match()
-    }
-
-    fn name(&self) -> &'static str {
-        "le"
-    }
-}
+numeric_operator!(EqOperator, "eq", ==);
+numeric_operator!(GtOperator, "gt", >);
+numeric_operator!(GeOperator, "ge", >=);
+numeric_operator!(LtOperator, "lt", <);
+numeric_operator!(LeOperator, "le", <=);
 
 #[cfg(test)]
 mod tests {

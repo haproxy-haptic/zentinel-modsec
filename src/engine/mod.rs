@@ -1,20 +1,38 @@
 //! Transaction engine for ModSecurity rule processing.
 
+pub mod body;
 pub mod chain;
 pub mod control;
+mod diagnostics;
+mod initialization;
 pub mod intervention;
+mod match_log;
 pub mod phase;
 pub mod ruleset;
 pub mod scoring;
+mod target_indices;
 pub mod transaction;
 
+pub use body::{BodyConfig, BodyLimitAction, BodyWriteResult};
 pub use control::{CtlDirective, TransactionControls};
 pub use intervention::Intervention;
 pub use ruleset::{CompiledRuleset, Rules};
-pub use transaction::{SetVarChange, SetVarEffect, Transaction};
+pub use transaction::{RuleMessage, SetVarChange, SetVarEffect, Transaction};
 
 use crate::error::Result;
 use std::sync::Arc;
+
+/// Split at the first nonempty operator macro. Empty and unclosed placeholders
+/// are literal text during both rule loading and transaction evaluation.
+fn split_operator_macro(input: &str) -> Option<(&str, &str, &str)> {
+    for (start, _) in input.match_indices("%{") {
+        let (name, suffix) = input[start + 2..].split_once('}')?;
+        if !name.is_empty() {
+            return Some((&input[..start], name, suffix));
+        }
+    }
+    None
+}
 
 /// Main ModSecurity engine.
 pub struct ModSecurity {
@@ -22,6 +40,7 @@ pub struct ModSecurity {
     ruleset: Arc<CompiledRuleset>,
     /// Default block status code.
     default_status: u16,
+    autodetect_structured_bodies: bool,
 }
 
 impl ModSecurity {
@@ -30,6 +49,7 @@ impl ModSecurity {
         Self {
             ruleset: Arc::new(ruleset),
             default_status: 403,
+            autodetect_structured_bodies: true,
         }
     }
 
@@ -50,9 +70,28 @@ impl ModSecurity {
         self.default_status = status;
     }
 
+    /// Select JSON and XML request processors from Content-Type automatically.
+    ///
+    /// The default is enabled. Disable this for Coraza's policy of requiring
+    /// an explicit `ctl:requestBodyProcessor` for JSON and XML. Form and
+    /// multipart requests retain their automatic processors in both modes.
+    pub fn set_autodetect_structured_request_bodies(&mut self, enabled: bool) {
+        self.autodetect_structured_bodies = enabled;
+    }
+
     /// Create a new transaction for processing a request.
     pub fn new_transaction(&self) -> Transaction {
-        Transaction::new(Arc::clone(&self.ruleset), self.default_status)
+        let mut tx = Transaction::new(Arc::clone(&self.ruleset), self.default_status);
+        tx.autodetect_structured_bodies = self.autodetect_structured_bodies;
+        tx
+    }
+
+    /// Create a transaction with a connector-supplied identifier.
+    /// Surrounding whitespace is trimmed. An empty ID requests a generated one.
+    pub fn new_transaction_with_id(&self, id: &str) -> Transaction {
+        let mut tx = self.new_transaction();
+        tx.set_initial_id(id);
+        tx
     }
 
     /// Get the ruleset.

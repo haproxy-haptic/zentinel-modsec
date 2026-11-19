@@ -26,6 +26,10 @@ pub enum OperatorName {
     Pm,
     /// Phrase match from file.
     PmFromFile,
+    /// Match phrases from a named inline dataset.
+    PmFromDataset,
+    /// Match a route and populate ARGS_PATH.
+    RestPath,
     /// Phrase match (alias).
     Pmf,
 
@@ -42,7 +46,7 @@ pub enum OperatorName {
     EndsWith,
     /// Within list.
     Within,
-    /// String match (single pattern, case-insensitive).
+    /// Case-sensitive substring match.
     StrMatch,
 
     // Numeric comparison
@@ -72,6 +76,8 @@ pub enum OperatorName {
     ValidateUtf8Encoding,
     /// Validate byte range.
     ValidateByteRange,
+    /// Validate national identifiers selected by a country-specific pattern.
+    ValidateNid,
     /// Validate hash.
     ValidateHash,
     /// Validate DTD.
@@ -92,6 +98,8 @@ pub enum OperatorName {
     IpMatch,
     /// IP address match from file.
     IpMatchFromFile,
+    /// Match addresses from a named inline dataset.
+    IpMatchFromDataset,
     /// IP address match (alias).
     IpMatchF,
     /// RBL lookup.
@@ -122,6 +130,8 @@ pub enum OperatorName {
 static OPERATOR_MAP: phf::Map<&'static str, OperatorName> = phf_map! {
     "rx" => OperatorName::Rx,
     "pm" => OperatorName::Pm,
+    "restpath" => OperatorName::RestPath,
+    "pmfromdataset" => OperatorName::PmFromDataset,
     "pmfromfile" => OperatorName::PmFromFile,
     "pmf" => OperatorName::Pmf,
     "streq" => OperatorName::StreQ,
@@ -142,6 +152,7 @@ static OPERATOR_MAP: phf::Map<&'static str, OperatorName> = phf_map! {
     "validateurlencoding" => OperatorName::ValidateUrlEncoding,
     "validateutf8encoding" => OperatorName::ValidateUtf8Encoding,
     "validatebyterange" => OperatorName::ValidateByteRange,
+    "validatenid" => OperatorName::ValidateNid,
     "validatehash" => OperatorName::ValidateHash,
     "validatedtd" => OperatorName::ValidateDtd,
     "validateschema" => OperatorName::ValidateSchema,
@@ -149,6 +160,7 @@ static OPERATOR_MAP: phf::Map<&'static str, OperatorName> = phf_map! {
     "verifyssn" => OperatorName::VerifySsn,
     "verifycpf" => OperatorName::VerifyCpf,
     "ipmatch" => OperatorName::IpMatch,
+    "ipmatchfromdataset" => OperatorName::IpMatchFromDataset,
     "ipmatchfromfile" => OperatorName::IpMatchFromFile,
     "ipmatchf" => OperatorName::IpMatchF,
     "rbl" => OperatorName::Rbl,
@@ -181,6 +193,27 @@ impl OperatorName {
         }
         let lower = std::str::from_utf8(&buf[..len]).ok()?;
         OPERATOR_MAP.get(lower).copied()
+    }
+
+    pub(crate) fn uses_data_file(self) -> bool {
+        matches!(
+            self,
+            Self::PmFromFile
+                | Self::Pmf
+                | Self::IpMatchFromFile
+                | Self::IpMatchF
+                | Self::ValidateSchema
+        )
+    }
+
+    pub(crate) fn uses_dataset(self) -> bool {
+        matches!(self, Self::PmFromDataset | Self::IpMatchFromDataset)
+    }
+
+    pub(crate) fn has_literal_source(self) -> bool {
+        self.uses_data_file()
+            || self.uses_dataset()
+            || matches!(self, Self::ValidateNid | Self::RestPath)
     }
 
     /// Check if this operator requires an argument.

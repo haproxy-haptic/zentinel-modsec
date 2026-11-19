@@ -28,8 +28,10 @@ pub use action::{
     parse_actions, Action, ControlAction, DataAction, DisruptiveAction, FlowAction, LoggingAction,
     MetadataAction, SetVarSpec, SetVarValue,
 };
+pub(crate) use action::{validate_setvar_target, SetVarOperand};
 pub use directive::{
-    Directive, RuleEngineMode, RuleIdSelector, SecAction, SecMarker, SecRule, UpdateTargetById,
+    BodyLimitAction, Directive, RuleEngineMode, RuleIdSelector, SecAction, SecMarker, SecRule,
+    UpdateTargetById, UpdateTargetByTag,
 };
 pub use lexer::{Lexer, Token, TokenKind};
 pub use operator::{OperatorName, OperatorSpec};
@@ -38,12 +40,43 @@ pub use variable::{Selection, VariableName, VariableSpec, XmlTarget};
 
 use crate::error::{Error, Result, SourceLocation};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+// Coraza counts Include directives cumulatively, including directives in
+// previously loaded files. One glob is one directive regardless of its size.
+const MAX_INCLUDES: usize = 100;
+
+/// Connector policy for loading rules from an alternate filesystem and handling
+/// directives owned by the connector. Called only when compiling a ruleset.
+pub trait ParserHost: Send + Sync {
+    /// Observe the exact contents the parser will use, including nested includes.
+    /// A connector can retain rule source for its audit records without reopening files.
+    fn parsed_file(&self, _path: &Path, _contents: &str) {}
+
+    /// Resolve one Include operand to readable files in evaluation order.
+    /// The declaring file is absent for inline directives.
+    fn includes(&self, declaring_file: Option<&Path>, operand: &Path) -> Result<Vec<PathBuf>>;
+
+    /// Resolve a phrase or IP list relative to its declaring rule.
+    fn data_file(&self, declaring_file: Option<&Path>, operand: &Path) -> Result<PathBuf>;
+
+    /// Accept a connector directive or report a configuration error at its source.
+    fn unknown_directive(
+        &self,
+        name: &str,
+        argument: &str,
+        location: &SourceLocation,
+    ) -> Result<()>;
+}
 
 /// Parser for ModSecurity configuration files.
 pub struct Parser {
+    host: Option<Arc<dyn ParserHost>>,
     /// Parsed directives.
     directives: Vec<Directive>,
+    /// Number of Include directives expanded into this configuration.
+    include_count: usize,
     /// Current source location for error reporting.
     location: SourceLocation,
     /// Default actions to apply to rules, keyed by the phase they configure.
@@ -52,16 +85,47 @@ pub struct Parser {
     /// each of the five phases -- so a single flat list would let the last
     /// directive parsed govern every phase.
     default_actions: HashMap<u8, Vec<Action>>,
+    // After an update can create a chain, the compiler needs to distinguish
+    // explicitly disruptive child actions from inherited defaults.
+    defer_defaults: bool,
 }
 
 impl Parser {
     /// Create a new parser.
     pub fn new() -> Self {
         Self {
+            host: None,
             directives: Vec::new(),
+            include_count: 0,
             location: SourceLocation::default(),
             default_actions: HashMap::new(),
+            defer_defaults: false,
         }
+    }
+
+    /// Delegate resource lookup and unknown-directive handling to a connector.
+    pub fn with_host(mut self, host: Arc<dyn ParserHost>) -> Self {
+        self.host = Some(host);
+        self
+    }
+
+    /// Append one caller-supplied source atomically. Included files participate
+    /// in the same append, so rollback only needs a single checkpoint.
+    fn try_append(&mut self, parse: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let count = self.directives.len();
+        let includes = self.include_count;
+        let defaults = self.default_actions.clone();
+        let defer_defaults = self.defer_defaults;
+        let location = self.location.clone();
+        if let Err(error) = parse(self) {
+            self.directives.truncate(count);
+            self.include_count = includes;
+            self.default_actions = defaults;
+            self.defer_defaults = defer_defaults;
+            self.location = location;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Parse a configuration string.
@@ -71,6 +135,10 @@ impl Parser {
 
     /// Parse a configuration string with file location.
     pub fn parse_with_location(&mut self, input: &str, file: Option<&Path>) -> Result<()> {
+        self.try_append(|parser| parser.parse_input(input, file))
+    }
+
+    fn parse_input(&mut self, input: &str, file: Option<&Path>) -> Result<()> {
         self.location.file = file.map(|p| p.to_path_buf());
         self.location.line = 1;
         self.location.column = 1;
@@ -106,28 +174,37 @@ impl Parser {
 
     /// Parse a configuration file.
     pub fn parse_file(&mut self, path: &Path) -> Result<()> {
+        self.try_append(|parser| parser.read_file(path))
+    }
+
+    fn read_file(&mut self, path: &Path) -> Result<()> {
         let content = std::fs::read_to_string(path).map_err(|e| Error::RuleFileLoad {
             path: path.to_path_buf(),
             source: e,
         })?;
-        self.parse_with_location(&content, Some(path))
+        if let Some(host) = &self.host {
+            host.parsed_file(path, &content);
+        }
+        self.parse_input(&content, Some(path))
     }
 
     /// Parse files matching a glob pattern.
     pub fn parse_glob(&mut self, pattern: &str) -> Result<()> {
+        self.try_append(|parser| parser.read_glob(pattern))
+    }
+
+    fn read_glob(&mut self, pattern: &str) -> Result<()> {
         let paths = glob::glob(pattern)
             .map_err(|e| Error::parse(format!("invalid glob pattern: {}", e), pattern))?;
 
         for entry in paths {
-            match entry {
-                Ok(path) => {
-                    if path.is_file() {
-                        self.parse_file(&path)?;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "error reading glob entry");
-                }
+            let path = entry.map_err(|e| Error::parse(e.to_string(), pattern))?;
+            let metadata = path.metadata().map_err(|source| Error::RuleFileLoad {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.is_file() {
+                self.read_file(&path)?;
             }
         }
 
@@ -151,19 +228,108 @@ impl Parser {
             "secaction" => self.parse_secaction(lexer),
             "secmarker" => self.parse_secmarker(lexer),
             "secruleengine" => self.parse_secruleengine(lexer),
+            "secdataset" => {
+                let (name, records) = lexer
+                    .dataset()
+                    .map_err(|message| Error::parse(message, self.location.to_string()))?;
+                Ok(Directive::SecDataset(name, records))
+            }
             "secdefaultaction" => self.parse_secdefaultaction(lexer),
             "secruleremovebyid" => self.parse_secruleremovebyid(lexer),
+            "secruleremovebytag" | "secruleremovebymsg" => {
+                let value = lexer.remaining_argument();
+                if value.is_empty() {
+                    return Err(Error::parse(
+                        format!("{name} requires a value"),
+                        self.location.to_string(),
+                    ));
+                }
+                Ok(if name.eq_ignore_ascii_case("SecRuleRemoveByTag") {
+                    Directive::SecRuleRemoveByTag(value)
+                } else {
+                    Directive::SecRuleRemoveByMsg(value)
+                })
+            }
             "secruleupdatetargetbyid" => self.parse_secruleupdatetargetbyid(lexer),
+            "secruleupdatetargetbytag" => self.parse_secruleupdatetargetbytag(lexer),
+            "secruleupdateactionbyid" => self.parse_action_update(lexer),
+            "secrxprefilter" => self.parse_boolean_directive(lexer, "SecRxPreFilter"),
             "secrequestbodyaccess" => self.parse_boolean_directive(lexer, "SecRequestBodyAccess"),
             "secresponsebodyaccess" => self.parse_boolean_directive(lexer, "SecResponseBodyAccess"),
+            "secargumentslimit" => {
+                self.parse_positive_limit(lexer, "SecArgumentsLimit", Directive::SecArgumentsLimit)
+            }
+            "secrequestbodyjsondepthlimit" => self.parse_positive_limit(
+                lexer,
+                "SecRequestBodyJsonDepthLimit",
+                Directive::SecRequestBodyJsonDepthLimit,
+            ),
+            "secresponsebodyjsondepthlimit" => self.parse_positive_limit(
+                lexer,
+                "SecResponseBodyJsonDepthLimit",
+                Directive::SecResponseBodyJsonDepthLimit,
+            ),
+            "secrequestbodyinmemorylimit" => self.parse_positive_limit(
+                lexer,
+                "SecRequestBodyInMemoryLimit",
+                Directive::SecRequestBodyInMemoryLimit,
+            ),
+            "secrequestbodylimit" => self.parse_body_limit(lexer, true),
+            "secresponsebodylimit" => self.parse_body_limit(lexer, false),
+            "secrequestbodylimitaction" => self.parse_body_limit_action(lexer, true),
+            "secresponsebodylimitaction" => self.parse_body_limit_action(lexer, false),
+            "secuploaddir" => {
+                let dir = self.expect_argument(lexer, "SecUploadDir")?;
+                if dir.is_empty() || self.peek_more_arguments(lexer) {
+                    return Err(Error::parse(
+                        "SecUploadDir requires one directory",
+                        self.location.to_string(),
+                    ));
+                }
+                Ok(Directive::SecUploadDir(dir.into()))
+            }
+            "secresponsebodymimetype" => {
+                let mut types = Vec::new();
+                while self.peek_more_arguments(lexer) {
+                    let argument = self.expect_argument(lexer, "SecResponseBodyMimeType")?;
+                    types.extend(argument.split_whitespace().map(str::to_owned));
+                }
+                if types.is_empty() {
+                    return Err(Error::parse(
+                        "SecResponseBodyMimeType requires a MIME type",
+                        self.location.to_string(),
+                    ));
+                }
+                Ok(Directive::SecResponseBodyMimeType(types))
+            }
+            "secresponsebodymimetypesclear" => {
+                if self.peek_more_arguments(lexer) {
+                    return Err(Error::parse(
+                        "SecResponseBodyMimeTypesClear takes no arguments",
+                        self.location.to_string(),
+                    ));
+                }
+                Ok(Directive::SecResponseBodyMimeTypesClear)
+            }
             "include" => self.parse_include(lexer),
-            // Recognized engine-config/metadata directives that have no effect on
-            // rule evaluation — skip quietly rather than warning.
-            "seccomponentsignature" | "seccollectiontimeout" => {
-                self.skip_to_end_of_line(lexer);
-                Ok(Directive::Unknown(name.to_string()))
+            "seccomponentsignature" => {
+                let mut signature = lexer.raw_remaining_argument();
+                if signature.len() >= 3 && signature.starts_with('"') && signature.ends_with('"') {
+                    signature = signature.trim_matches('"').to_owned();
+                }
+                if signature.is_empty() {
+                    return Err(Error::parse(
+                        "SecComponentSignature requires an argument",
+                        self.location.to_string(),
+                    ));
+                }
+                Ok(Directive::SecComponentSignature(signature))
             }
             _ => {
+                if let Some(host) = &self.host {
+                    host.unknown_directive(name, &lexer.remaining_argument(), &self.location)?;
+                    return Ok(Directive::Unknown(name.to_string()));
+                }
                 // Skip unknown directives with a warning
                 tracing::warn!(
                     directive = name,
@@ -185,19 +351,19 @@ impl Parser {
         // Parse operator
         let operator_str = self.expect_quoted_argument(lexer, "SecRule operator")?;
         let mut operator = operator::parse_operator(&operator_str)?;
-        self.resolve_operator_file_path(&mut operator);
+        self.resolve_operator_file_path(&mut operator)?;
 
         // Parse actions (optional)
         let actions = if self.peek_quoted(lexer) {
             let actions_str = self.expect_quoted_argument(lexer, "SecRule actions")?;
-            let mut actions = action::parse_actions(&actions_str)?;
-            // Apply default actions
-            actions = self.merge_default_actions(actions);
+            action::parse_actions(&actions_str)?
+        } else {
+            Vec::new()
+        };
+        let actions = if self.defer_defaults {
             actions
         } else {
-            // No actions of its own: it still inherits the defaults for the
-            // phase it lands in, which with no `phase` action is phase 2.
-            self.defaults_for_phase(DEFAULT_PHASE).to_vec()
+            self.merge_default_actions(actions)
         };
 
         Ok(Directive::SecRule(SecRule {
@@ -211,22 +377,27 @@ impl Parser {
     /// Resolve a relative data-file argument (`@pmFromFile`/`@ipMatchFromFile`)
     /// against the directory of the file currently being parsed, matching how
     /// ModSecurity/CRS reference their `.data` files.
-    fn resolve_operator_file_path(&self, operator: &mut OperatorSpec) {
-        if !matches!(
-            operator.name,
-            OperatorName::PmFromFile | OperatorName::IpMatchFromFile
-        ) {
-            return;
+    fn resolve_operator_file_path(&self, operator: &mut OperatorSpec) -> Result<()> {
+        if !operator.name.uses_data_file() || operator.name == OperatorName::ValidateSchema {
+            return Ok(());
+        }
+        if let Some(host) = &self.host {
+            operator.argument = host
+                .data_file(self.location.file.as_deref(), Path::new(&operator.argument))?
+                .to_string_lossy()
+                .into_owned();
+            return Ok(());
         }
         if std::path::Path::new(&operator.argument).is_absolute() {
-            return;
+            return Ok(());
         }
         if let Some(parent) = self.location.file.as_ref().and_then(|f| f.parent()) {
-            let joined = parent.join(&operator.argument);
-            if joined.exists() {
-                operator.argument = joined.to_string_lossy().into_owned();
-            }
+            operator.argument = parent
+                .join(&operator.argument)
+                .to_string_lossy()
+                .into_owned();
         }
+        Ok(())
     }
 
     /// Parse a SecAction directive.
@@ -265,10 +436,21 @@ impl Parser {
 
     /// Parse a SecDefaultAction directive.
     fn parse_secdefaultaction(&mut self, lexer: &mut Lexer) -> Result<Directive> {
-        let actions_str = self.expect_quoted_argument(lexer, "SecDefaultAction")?;
+        lexer.skip_whitespace();
+        let actions_str = if matches!(lexer.peek(), Some('"' | '\'')) {
+            self.expect_quoted_argument(lexer, "SecDefaultAction")?
+        } else {
+            let argument = lexer.remaining_argument();
+            if argument.is_empty() {
+                return Err(Error::parse(
+                    "SecDefaultAction requires an argument",
+                    self.location.to_string(),
+                ));
+            }
+            argument
+        };
         let actions = action::parse_actions(&actions_str)?;
-        self.default_actions
-            .insert(phase_of(&actions).unwrap_or(DEFAULT_PHASE), actions.clone());
+        self.set_default_actions(&actions);
         Ok(Directive::SecDefaultAction(actions))
     }
 
@@ -287,6 +469,51 @@ impl Parser {
             }
         }
         Ok(Directive::SecRuleRemoveById(ids))
+    }
+
+    fn parse_action_update(&mut self, lexer: &mut Lexer) -> Result<Directive> {
+        let argument = lexer.remaining_argument();
+        let mut fields = argument.split_whitespace();
+        let invalid = |message: &str| {
+            Error::parse(
+                format!("SecRuleUpdateActionById: {message}"),
+                self.location.to_string(),
+            )
+        };
+        let raw_actions = fields
+            .next_back()
+            .ok_or_else(|| invalid("missing action list"))?
+            .trim_matches('"');
+        let mut selectors = Vec::new();
+        for field in fields {
+            let (lo, hi) = field.split_once('-').unwrap_or((field, field));
+            let number = |v: &str| v.parse::<i64>().ok().and_then(|n| u64::try_from(n).ok());
+            let (Some(lo), Some(hi)) = (number(lo), number(hi)) else {
+                return Err(invalid("invalid rule ID or range"));
+            };
+            if lo > hi {
+                return Err(invalid("reversed ID range"));
+            }
+            if lo == hi {
+                selectors.push(RuleIdSelector::Single(lo));
+                // Coraza returns immediately after applying the first singleton.
+                break;
+            }
+            selectors.push(RuleIdSelector::Range(lo, hi));
+        }
+        if selectors.is_empty() {
+            return Err(invalid("missing rule ID or range"));
+        }
+        let actions = action::parse_update_actions(raw_actions)?;
+        self.defer_defaults |= actions
+            .iter()
+            .any(|a| matches!(a, Action::Flow(FlowAction::Chain)));
+        match selectors.as_slice() {
+            [RuleIdSelector::Single(id)] => {
+                Ok(Directive::SecRuleUpdateActionById { id: *id, actions })
+            }
+            _ => Ok(Directive::SecRuleUpdateActionByIdRanges { selectors, actions }),
+        }
     }
 
     /// Parse a SecRuleUpdateTargetById directive.
@@ -320,6 +547,55 @@ impl Parser {
             exclusions,
             replaced,
             location: self.location.clone(),
+        }))
+    }
+
+    /// Parse a case-sensitive tag selector and its target update.
+    fn parse_secruleupdatetargetbytag(&mut self, lexer: &mut Lexer) -> Result<Directive> {
+        let tag = self.expect_argument(lexer, "SecRuleUpdateTargetByTag tag")?;
+        if tag.is_empty() {
+            return Err(Error::parse(
+                "SecRuleUpdateTargetByTag requires a tag",
+                self.location.to_string(),
+            ));
+        }
+        let target_text = self.expect_argument(lexer, "SecRuleUpdateTargetByTag targets")?;
+        let (additions, exclusions) = variable::parse_update_targets(&target_text)?;
+        if additions.is_empty() && exclusions.is_empty() {
+            return Err(Error::parse(
+                "SecRuleUpdateTargetByTag requires at least one target",
+                self.location.to_string(),
+            ));
+        }
+        // Exclusion regexes must fail at load, not silently match nothing.
+        for exclusion in &exclusions {
+            validate_update_target(exclusion)?;
+        }
+        for addition in &additions {
+            validate_target_regex(addition)?;
+        }
+        let replaced = if self.peek_more_arguments(lexer) {
+            let target = self.expect_argument(lexer, "SecRuleUpdateTargetByTag replaced target")?;
+            validate_update_target(&target)?;
+            Some(target)
+        } else {
+            None
+        };
+        if self.peek_more_arguments(lexer) {
+            return Err(Error::parse(
+                "unexpected SecRuleUpdateTargetByTag argument",
+                self.location.to_string(),
+            ));
+        }
+        Ok(Directive::SecRuleUpdateTargetByTag(UpdateTargetByTag {
+            tag,
+            targets: UpdateTargetById {
+                ids: Vec::new(),
+                additions,
+                exclusions,
+                replaced,
+                location: self.location.clone(),
+            },
         }))
     }
 
@@ -373,6 +649,76 @@ impl Parser {
         !matches!(lexer.peek(), None | Some('\n') | Some('\r') | Some('#'))
     }
 
+    fn parse_positive_limit(
+        &mut self,
+        lexer: &mut Lexer,
+        name: &str,
+        directive: fn(usize) -> Directive,
+    ) -> Result<Directive> {
+        let value = self.expect_argument(lexer, name)?;
+        value
+            .parse::<isize>()
+            .ok()
+            .filter(|limit| *limit > 0)
+            .filter(|_| !self.peek_more_arguments(lexer))
+            .map(|limit| directive(limit as usize))
+            .ok_or_else(|| {
+                Error::parse(
+                    format!("{name} requires a positive integer"),
+                    self.location.to_string(),
+                )
+            })
+    }
+
+    /// Parse a bounded byte count for request or response acquisition.
+    fn parse_body_limit(&mut self, lexer: &mut Lexer, request: bool) -> Result<Directive> {
+        let name = if request {
+            "SecRequestBodyLimit"
+        } else {
+            "SecResponseBodyLimit"
+        };
+        let text = self.expect_argument(lexer, name)?;
+        let limit = text
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| (1..=1_073_741_824).contains(limit))
+            .ok_or_else(|| {
+                Error::parse(
+                    format!("{name} requires a byte count between 1 and 1073741824"),
+                    self.location.to_string(),
+                )
+            })?;
+        Ok(if request {
+            Directive::SecRequestBodyLimit(limit)
+        } else {
+            Directive::SecResponseBodyLimit(limit)
+        })
+    }
+
+    fn parse_body_limit_action(&mut self, lexer: &mut Lexer, request: bool) -> Result<Directive> {
+        let name = if request {
+            "SecRequestBodyLimitAction"
+        } else {
+            "SecResponseBodyLimitAction"
+        };
+        let text = self.expect_argument(lexer, name)?;
+        let action = match text.to_ascii_lowercase().as_str() {
+            "reject" => BodyLimitAction::Reject,
+            "processpartial" => BodyLimitAction::ProcessPartial,
+            _ => {
+                return Err(Error::parse(
+                    format!("{name} accepts Reject or ProcessPartial"),
+                    self.location.to_string(),
+                ))
+            }
+        };
+        Ok(if request {
+            Directive::SecRequestBodyLimitAction(action)
+        } else {
+            Directive::SecResponseBodyLimitAction(action)
+        })
+    }
+
     /// Parse a boolean directive (On/Off).
     fn parse_boolean_directive(&mut self, lexer: &mut Lexer, name: &str) -> Result<Directive> {
         let value_str = self.expect_argument(lexer, name)?;
@@ -388,6 +734,7 @@ impl Parser {
         };
 
         match name {
+            "SecRxPreFilter" => Ok(Directive::SecRxPreFilter(value)),
             "SecRequestBodyAccess" => Ok(Directive::SecRequestBodyAccess(value)),
             "SecResponseBodyAccess" => Ok(Directive::SecResponseBodyAccess(value)),
             _ => Ok(Directive::Unknown(name.to_string())),
@@ -397,27 +744,45 @@ impl Parser {
     /// Parse an Include directive.
     fn parse_include(&mut self, lexer: &mut Lexer) -> Result<Directive> {
         let path = self.expect_argument(lexer, "Include path")?;
+        if self.include_count >= MAX_INCLUDES {
+            return Err(Error::parse(
+                format!("configuration exceeds the limit of {MAX_INCLUDES} Include directives"),
+                self.location.to_string(),
+            ));
+        }
+        self.include_count += 1;
 
-        // Resolve relative paths (including globs) against the including file's
-        // directory. A glob pattern never `exists()` as a literal path, so it is
-        // detected explicitly rather than falling back to a CWD-relative path.
-        let resolved_path =
-            if let Some(parent) = self.location.file.as_ref().and_then(|f| f.parent()) {
-                let candidate = parent.join(&path);
-                let is_glob = path.contains(['*', '?', '[']);
-                if candidate.exists() || is_glob {
-                    candidate.to_string_lossy().to_string()
-                } else {
-                    path
-                }
-            } else {
-                path
-            };
+        let is_glob = path.contains(['*', '?', '[']);
+        let path = Path::new(&path);
+        let including_location = self.location.clone();
+        let parent = including_location
+            .file
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|_| path.is_relative())
+            .unwrap_or(Path::new(""));
+        let resolved_path = parent.join(path);
+        let parsed = if let Some(host) = &self.host {
+            let paths = host.includes(including_location.file.as_deref(), path)?;
+            paths.iter().try_for_each(|path| self.read_file(path))
+        } else if is_glob {
+            // Only the directive's operand is a pattern. The declaring
+            // directory may itself have brackets or other glob characters.
+            let parent = parent.to_str().ok_or_else(|| {
+                Error::parse(
+                    "glob include needs a UTF-8 directory",
+                    including_location.to_string(),
+                )
+            })?;
+            let escaped = glob::Pattern::escape(parent);
+            self.read_glob(&Path::new(&escaped).join(path).to_string_lossy())
+        } else {
+            self.read_file(&resolved_path)
+        };
+        self.location = including_location;
+        parsed?;
 
-        // Parse the included file(s)
-        self.parse_glob(&resolved_path)?;
-
-        Ok(Directive::Include(resolved_path.into()))
+        Ok(Directive::Include(resolved_path))
     }
 
     /// Expect an unquoted argument.
@@ -467,14 +832,20 @@ impl Parser {
     /// Skip to end of current line.
     fn skip_to_end_of_line(&self, lexer: &mut Lexer) {
         while let Some(token) = lexer.next_token() {
-            if matches!(token.kind, TokenKind::Newline) {
+            // Comment tokens already consume their terminating newline.
+            if matches!(token.kind, TokenKind::Comment | TokenKind::Newline) {
                 break;
             }
         }
     }
 
     /// Merge default actions with rule-specific actions.
-    fn merge_default_actions(&self, rule_actions: Vec<Action>) -> Vec<Action> {
+    pub(crate) fn set_default_actions(&mut self, actions: &[Action]) {
+        self.default_actions
+            .insert(phase_of(actions).unwrap_or(DEFAULT_PHASE), actions.to_vec());
+    }
+
+    pub(crate) fn merge_default_actions(&self, rule_actions: Vec<Action>) -> Vec<Action> {
         let phase = phase_of(&rule_actions).unwrap_or(DEFAULT_PHASE);
         let defaults = self.defaults_for_phase(phase);
 
@@ -553,7 +924,7 @@ impl Default for Parser {
 /// `ctl`, `initcol`, ...) never supersede anything. Single-valued actions
 /// supersede an earlier action of the same kind; `log`/`nolog` and
 /// `auditlog`/`noauditlog` are opposites of one switch and supersede each other.
-fn action_supersedes(new: &Action, old: &Action) -> bool {
+pub(crate) fn action_supersedes(new: &Action, old: &Action) -> bool {
     match (new, old) {
         (Action::Disruptive(_), Action::Disruptive(_)) => true,
         (Action::Flow(a), Action::Flow(b)) => {
@@ -576,6 +947,30 @@ fn action_supersedes(new: &Action, old: &Action) -> bool {
         (Action::Data(DataAction::Capture), Action::Data(DataAction::Capture)) => true,
         _ => false,
     }
+}
+
+/// Validate a target and its optional regex before accepting an exclusion.
+fn validate_update_target(target: &str) -> Result<()> {
+    let spec = parse_single_variable(target)?;
+    if spec.count_mode {
+        return Err(Error::parse(
+            "target exclusions and replacements cannot use count mode",
+            target,
+        ));
+    }
+    validate_target_regex(&spec)
+}
+
+fn validate_target_regex(target: &VariableSpec) -> Result<()> {
+    if let Some(Selection::Regex(pattern)) = &target.selection {
+        crate::variables::compile_selector(pattern, target.name).map_err(|source| {
+            Error::RegexCompile {
+                pattern: pattern.clone(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

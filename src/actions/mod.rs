@@ -55,8 +55,12 @@ pub enum DisruptiveOutcome {
     Deny(u16),
     /// Block (defer to SecRuleEngine).
     Block,
-    /// Allow the request.
+    /// Skip remaining rules for the entire transaction.
     Allow,
+    /// Skip remaining rules in the current phase.
+    AllowPhase,
+    /// Skip remaining request-phase rules.
+    AllowRequest,
     /// Redirect to URL.
     Redirect(String),
     /// Pass (continue but mark as matched).
@@ -109,6 +113,8 @@ pub enum SetVarOperation {
 pub struct RuleMetadata {
     /// Rule ID.
     pub id: Option<String>,
+    /// Explicit disruptive status, independent of action ordering.
+    pub status: Option<u16>,
     /// Rule message.
     pub msg: Option<String>,
     /// Log message.
@@ -143,6 +149,10 @@ pub fn execute_actions(
             Action::Disruptive(d) => {
                 result.disruptive = Some(execute_disruptive(d));
             }
+            Action::Flow(FlowAction::MultiMatch) => {
+                // This controls operator evaluation, and must not overwrite a
+                // skip/skipAfter/chain flow action that appeared before it.
+            }
             Action::Flow(f) => {
                 result.flow = execute_flow(f);
             }
@@ -160,12 +170,22 @@ pub fn execute_actions(
                 // per-transaction state, which is not reachable from here.
                 result.control_ops.push(ctl.clone());
             }
+            Action::Unsupported(_) => {
+                // The loader reports the affected rule IDs before evaluation.
+            }
             Action::Transformation(_) => {
                 // Transformations are applied during variable resolution, not execution
             }
         }
     }
 
+    if let Some(DisruptiveOutcome::Deny(status)) = result.disruptive.as_mut() {
+        *status = result
+            .metadata
+            .status
+            .filter(|status| *status != 0)
+            .unwrap_or(*status);
+    }
     result
 }
 
@@ -174,9 +194,9 @@ fn execute_disruptive(action: &DisruptiveAction) -> DisruptiveOutcome {
     match action {
         DisruptiveAction::Deny => DisruptiveOutcome::Deny(403),
         DisruptiveAction::Block => DisruptiveOutcome::Block,
-        DisruptiveAction::Allow | DisruptiveAction::AllowPhase | DisruptiveAction::AllowRequest => {
-            DisruptiveOutcome::Allow
-        }
+        DisruptiveAction::Allow => DisruptiveOutcome::Allow,
+        DisruptiveAction::AllowPhase => DisruptiveOutcome::AllowPhase,
+        DisruptiveAction::AllowRequest => DisruptiveOutcome::AllowRequest,
         DisruptiveAction::Pass => DisruptiveOutcome::Pass,
         DisruptiveAction::Drop => DisruptiveOutcome::Drop,
         DisruptiveAction::Redirect(url) => DisruptiveOutcome::Redirect(url.clone()),
@@ -205,6 +225,7 @@ fn execute_data(action: &DataAction, result: &mut ActionResult, _matched_value: 
                 SetVarValue::Int(v) => SetVarOperation::Set(v.to_string()),
                 SetVarValue::Increment(v) => SetVarOperation::Increment(*v),
                 SetVarValue::Decrement(v) => SetVarOperation::Decrement(*v),
+                SetVarValue::Unresolved => return,
                 SetVarValue::Delete => SetVarOperation::Delete,
                 SetVarValue::Macro(s) => SetVarOperation::Macro(s.clone()),
             };
@@ -236,6 +257,17 @@ fn execute_data(action: &DataAction, result: &mut ActionResult, _matched_value: 
             // Response body modification not implemented
         }
     }
+}
+
+/// Materialize audit metadata only for an intervention that retains it.
+pub(crate) fn rule_metadata(actions: &[Action]) -> RuleMetadata {
+    let mut metadata = RuleMetadata::default();
+    for action in actions {
+        if let Action::Metadata(m) = action {
+            execute_metadata(m, &mut metadata);
+        }
+    }
+    metadata
 }
 
 /// Execute a metadata action.
@@ -271,8 +303,8 @@ fn execute_metadata(action: &MetadataAction, metadata: &mut RuleMetadata) {
         MetadataAction::LogData(data) => {
             metadata.logdata = Some(data.clone());
         }
-        MetadataAction::Status(_) => {
-            // Status is handled at disruptive action level
+        MetadataAction::Status(status) => {
+            metadata.status = Some(*status);
         }
     }
 }
@@ -310,6 +342,38 @@ mod tests {
             result.disruptive,
             Some(DisruptiveOutcome::Deny(403))
         ));
+    }
+
+    #[test]
+    fn allow_outcomes_preserve_the_parsed_scope() {
+        use crate::parser::parse_actions;
+
+        for input in [
+            "allow",
+            "allow:",
+            "allow:''",
+            "allow:'phase'",
+            "ALLOW: request",
+        ] {
+            let actions = parse_actions(input).unwrap();
+            let outcome = execute_actions(&actions, None, &[]).disruptive.unwrap();
+            assert!(is_allow(&outcome));
+            assert!(!is_terminal(&outcome));
+            assert_eq!(status_for_outcome(&outcome, 403), 200);
+            assert!(match input {
+                "allow:'phase'" => matches!(outcome, DisruptiveOutcome::AllowPhase),
+                "ALLOW: request" => matches!(outcome, DisruptiveOutcome::AllowRequest),
+                _ => matches!(outcome, DisruptiveOutcome::Allow),
+            });
+        }
+        for invalid in [
+            "allow:PHASE",
+            "allow:'REQUEST'",
+            "allow:' phase '",
+            "allow:other",
+        ] {
+            assert!(parse_actions(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

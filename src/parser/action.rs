@@ -19,6 +19,8 @@ pub enum Action {
     Control(ControlAction),
     /// Transformation (t:xxx).
     Transformation(String),
+    /// Recognized action that this engine cannot execute (reported at load).
+    Unsupported(String),
 }
 
 /// Disruptive actions.
@@ -139,6 +141,8 @@ pub enum SetVarValue {
     Increment(i64),
     /// Decrement by amount.
     Decrement(i64),
+    /// A signed operand referring to a missing TX value leaves the destination unchanged.
+    Unresolved,
     /// Delete variable.
     Delete,
     /// Raw right-hand side containing `%{...}` macros, resolved at apply time.
@@ -169,7 +173,7 @@ pub enum LoggingAction {
 }
 
 /// Control actions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ControlAction {
     /// Control directive.
     pub directive: String,
@@ -223,6 +227,14 @@ fn normalize_line_continuations(input: &str) -> String {
 
 /// Parse an action list from a string.
 pub fn parse_actions(input: &str) -> Result<Vec<Action>> {
+    parse_action_list(input, false)
+}
+
+pub(super) fn parse_update_actions(input: &str) -> Result<Vec<Action>> {
+    parse_action_list(input, true)
+}
+
+fn parse_action_list(input: &str, update: bool) -> Result<Vec<Action>> {
     // First, normalize line continuations (backslash followed by newline and optional whitespace)
     let normalized = normalize_line_continuations(input);
 
@@ -233,6 +245,15 @@ pub fn parse_actions(input: &str) -> Result<Vec<Action>> {
     let mut quote_char = '"';
     let mut paren_depth: u32 = 0;
 
+    let mut push_action = |item: &str| -> Result<()> {
+        let item = item.trim();
+        if update {
+            actions.push(parse_update_action(item)?);
+        } else if !item.is_empty() {
+            actions.push(parse_single_action(item)?);
+        }
+        Ok(())
+    };
     for c in chars {
         match c {
             '"' | '\'' if !in_quotes => {
@@ -253,9 +274,7 @@ pub fn parse_actions(input: &str) -> Result<Vec<Action>> {
                 current.push(c);
             }
             ',' if !in_quotes && paren_depth == 0 => {
-                if !current.trim().is_empty() {
-                    actions.push(parse_single_action(current.trim())?);
-                }
+                push_action(&current)?;
                 current.clear();
             }
             _ => {
@@ -265,11 +284,51 @@ pub fn parse_actions(input: &str) -> Result<Vec<Action>> {
     }
 
     // Don't forget the last action
-    if !current.trim().is_empty() {
-        actions.push(parse_single_action(current.trim())?);
-    }
+    push_action(&current)?;
 
     Ok(actions)
+}
+
+/// Validate the arguments of the actions registered by the reference updater.
+fn parse_update_action(item: &str) -> Result<Action> {
+    let (name, value) = item.split_once(':').unwrap_or((item, ""));
+    let name = name.to_ascii_lowercase();
+    let value = unquote(value);
+    let valid = match name.as_str() {
+        "pass" | "deny" | "drop" | "block" | "log" | "nolog" | "auditlog" | "noauditlog"
+        | "capture" | "multimatch" | "chain" => value.is_empty(),
+        "id" => value.parse::<i64>().is_ok_and(|n| n > 0),
+        "maturity" | "accuracy" => value.parse::<u8>().is_ok_and(|n| (1..=9).contains(&n)),
+        "allow" => matches!(value, "" | "phase" | "request"),
+        "phase" | "skip" | "msg" | "logdata" | "tag" | "t" | "setvar" | "skipafter"
+        | "redirect" | "severity" | "status" | "ctl" | "rev" | "ver" | "exec" | "initcol"
+        | "expirevar" => !value.is_empty(),
+        _ => false,
+    };
+    if !valid {
+        return Err(Error::InvalidActionArgument {
+            action: name,
+            message: "invalid action or argument in update".into(),
+        });
+    }
+    if name == "phase" {
+        let phase = match value {
+            "request" => Some(2),
+            "response" => Some(4),
+            "logging" => Some(5),
+            _ => value.parse::<u8>().ok().filter(|p| (1..=5).contains(p)),
+        }
+        .ok_or_else(|| Error::InvalidActionArgument {
+            action: name,
+            message: "invalid phase".into(),
+        })?;
+        return Ok(Action::Metadata(MetadataAction::Phase(phase)));
+    }
+    if item.contains(':') {
+        parse_single_action(&format!("{name}:{value}"))
+    } else {
+        parse_single_action(&name)
+    }
 }
 
 /// Parse a single action.
@@ -295,7 +354,25 @@ fn parse_single_action(input: &str) -> Result<Action> {
         "deny" => Ok(Action::Disruptive(DisruptiveAction::Deny)),
         "block" => Ok(Action::Disruptive(DisruptiveAction::Block)),
         "pass" => Ok(Action::Disruptive(DisruptiveAction::Pass)),
-        "allow" => Ok(Action::Disruptive(DisruptiveAction::Allow)),
+        "allow" => {
+            let argument = argument.as_deref().unwrap_or_default().trim();
+            let scope = argument
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+                .unwrap_or(argument);
+            let action = match scope {
+                "" => DisruptiveAction::Allow,
+                "phase" => DisruptiveAction::AllowPhase,
+                "request" => DisruptiveAction::AllowRequest,
+                _ => {
+                    return Err(Error::InvalidActionArgument {
+                        action: "allow".into(),
+                        message: "expected phase or request".into(),
+                    })
+                }
+            };
+            Ok(Action::Disruptive(action))
+        }
         "drop" => Ok(Action::Disruptive(DisruptiveAction::Drop)),
         "redirect" => {
             let url = argument.ok_or_else(|| Error::InvalidActionArgument {
@@ -329,7 +406,16 @@ fn parse_single_action(input: &str) -> Result<Action> {
         "id" => {
             let id: u64 = argument
                 .as_ref()
-                .and_then(|s| s.parse().ok())
+                .and_then(|s| {
+                    let numeric = if let Some(inner) = s.strip_prefix('\'') {
+                        inner.strip_suffix('\'')?
+                    } else if let Some(inner) = s.strip_prefix('"') {
+                        inner.strip_suffix('"')?
+                    } else {
+                        s.as_str()
+                    };
+                    numeric.parse().ok()
+                })
                 .ok_or_else(|| Error::InvalidActionArgument {
                     action: "id".to_string(),
                     message: "invalid ID".to_string(),
@@ -440,12 +526,12 @@ fn parse_single_action(input: &str) -> Result<Action> {
                 action: "ctl".to_string(),
                 message: "missing control specification".to_string(),
             })?;
-            let (directive, value) = if let Some(pos) = spec.find('=') {
-                (spec[..pos].to_string(), spec[pos + 1..].to_string())
-            } else {
-                (spec, String::new())
-            };
-            Ok(Action::Control(ControlAction { directive, value }))
+            let spec = unquote(&spec);
+            let (directive, value) = spec.split_once('=').unwrap_or((spec, ""));
+            Ok(Action::Control(ControlAction {
+                directive: directive.to_owned(),
+                value: value.to_owned(),
+            }))
         }
 
         // initcol:collection=key - initialize a persistent collection
@@ -463,15 +549,17 @@ fn parse_single_action(input: &str) -> Result<Action> {
         }
 
         // setsid/setuid - set session/user ID
-        "setsid" | "setuid" => {
-            // These are used for persistent storage, we'll just acknowledge them
-            Ok(Action::Logging(LoggingAction::NoAuditLog)) // Placeholder - doesn't affect rule matching
-        }
+        "setsid" => Ok(Action::Data(DataAction::SetSid(
+            argument.unwrap_or_default(),
+        ))),
+        "setuid" => Ok(Action::Data(DataAction::SetUid(
+            argument.unwrap_or_default(),
+        ))),
 
         // deprecatevar - deprecated variable handling
-        "deprecatevar" => {
-            Ok(Action::Logging(LoggingAction::NoAuditLog)) // Placeholder
-        }
+        "deprecatevar" => Ok(Action::Data(DataAction::DeprecateVar(
+            argument.unwrap_or_default(),
+        ))),
 
         // expirevar - set variable expiration
         "expirevar" => {
@@ -490,19 +578,24 @@ fn parse_single_action(input: &str) -> Result<Action> {
         "multimatch" => Ok(Action::Flow(FlowAction::MultiMatch)),
 
         // exec - execute an external script (acknowledged but not executed)
-        "exec" => Ok(Action::Logging(LoggingAction::NoAuditLog)), // Placeholder
+        "exec" => Ok(Action::Data(DataAction::Exec(argument.unwrap_or_default()))),
 
         // append/prepend - append/prepend to response body (acknowledged)
-        "append" | "prepend" => Ok(Action::Logging(LoggingAction::NoAuditLog)), // Placeholder
+        "append" => Ok(Action::Data(DataAction::Append(
+            argument.unwrap_or_default(),
+        ))),
+        "prepend" => Ok(Action::Data(DataAction::Prepend(
+            argument.unwrap_or_default(),
+        ))),
 
         // proxy - proxy request (acknowledged)
-        "proxy" => Ok(Action::Logging(LoggingAction::NoAuditLog)), // Placeholder
+        "proxy" => Ok(Action::Unsupported("proxy".into())),
 
         // pause - pause processing (acknowledged)
-        "pause" => Ok(Action::Logging(LoggingAction::NoAuditLog)), // Placeholder
+        "pause" => Ok(Action::Unsupported("pause".into())),
 
         // xmlns - XML namespace (acknowledged)
-        "xmlns" => Ok(Action::Logging(LoggingAction::NoAuditLog)), // Placeholder
+        "xmlns" => Ok(Action::Unsupported("xmlns".into())),
 
         _ => Err(Error::UnknownAction {
             name: name.to_string(),
@@ -510,23 +603,31 @@ fn parse_single_action(input: &str) -> Result<Action> {
     }
 }
 
-/// Parse a setvar specification.
-fn parse_setvar(input: &str) -> Result<SetVarSpec> {
-    let input = input.trim();
-    // CRS writes setvar specs in quoted form, e.g. setvar:'tx.score=+5'.
-    // Strip a matching pair of surrounding quotes so the value parses correctly.
-    let input = if input.len() >= 2
+fn unquote(input: &str) -> &str {
+    if input.len() >= 2
         && ((input.starts_with('\'') && input.ends_with('\''))
             || (input.starts_with('"') && input.ends_with('"')))
     {
         &input[1..input.len() - 1]
     } else {
         input
-    };
+    }
+}
 
-    // Check for delete (!var)
-    if let Some(var) = input.strip_prefix('!') {
-        let (collection, key) = parse_var_name(var)?;
+/// Parse a setvar specification.
+fn parse_setvar(input: &str) -> Result<SetVarSpec> {
+    let input = input.trim();
+    // CRS writes setvar specs in quoted form, e.g. setvar:'tx.score=+5'.
+    let input = unquote(input);
+
+    let (delete, input) = input
+        .strip_prefix('!')
+        .map_or((false, input), |rest| (true, rest));
+    let (var, value_str) = input
+        .split_once('=')
+        .map_or((input, None), |(var, value)| (var, Some(value)));
+    let (collection, key) = parse_var_name(var)?;
+    if delete {
         return Ok(SetVarSpec {
             collection,
             key,
@@ -534,35 +635,24 @@ fn parse_setvar(input: &str) -> Result<SetVarSpec> {
         });
     }
 
-    // Split on = for assignment
-    let (var, value_str) = if let Some(pos) = input.find('=') {
-        (&input[..pos], Some(&input[pos + 1..]))
-    } else {
-        (input, None)
-    };
-
-    let (collection, key) = parse_var_name(var)?;
-
-    let value = if let Some(val) = value_str {
-        if val.contains("%{") {
-            // Contains a macro (e.g. +%{tx.critical_anomaly_score}); defer the
-            // sign/value interpretation until the macro is expanded at apply time.
-            SetVarValue::Macro(val.to_string())
-        } else if let Some(rest) = val.strip_prefix('+') {
-            // Increment
-            let amount: i64 = rest.parse().unwrap_or(1);
-            SetVarValue::Increment(amount)
-        } else if let Some(rest) = val.strip_prefix('-') {
-            // Decrement
-            let amount: i64 = rest.parse().unwrap_or(1);
-            SetVarValue::Decrement(amount)
-        } else if let Ok(n) = val.parse::<i64>() {
-            SetVarValue::Int(n)
-        } else {
-            SetVarValue::String(val.to_string())
+    let val = value_str.filter(|value| !value.is_empty()).ok_or_else(|| {
+        Error::InvalidActionArgument {
+            action: "setvar".into(),
+            message: "expected a value after TX.member=".into(),
         }
+    })?;
+    let value = if val.contains("%{") {
+        SetVarValue::Macro(val.to_string())
     } else {
-        SetVarValue::String("1".to_string())
+        match SetVarOperand::parse(val.as_bytes()) {
+            SetVarOperand::Add(n) => SetVarValue::Increment(n),
+            SetVarOperand::Subtract(n) => SetVarValue::Decrement(n),
+            SetVarOperand::Unresolved => SetVarValue::Unresolved,
+            SetVarOperand::Text => match val.parse::<i64>() {
+                Ok(n) if val.len() == 1 || !val.starts_with('0') => SetVarValue::Int(n),
+                _ => SetVarValue::String(val.to_owned()),
+            },
+        }
     };
 
     Ok(SetVarSpec {
@@ -574,11 +664,52 @@ fn parse_setvar(input: &str) -> Result<SetVarSpec> {
 
 /// Parse a variable name into collection and key.
 fn parse_var_name(input: &str) -> Result<(String, String)> {
-    if let Some(pos) = input.find('.') {
-        Ok((input[..pos].to_lowercase(), input[pos + 1..].to_string()))
+    let (collection, key) = input.split_once('.').unwrap_or(("", input));
+    validate_setvar_target(collection, key)?;
+    Ok(("tx".into(), key.to_owned()))
+}
+
+pub(crate) fn validate_setvar_target(collection: &str, key: &str) -> Result<()> {
+    if collection.eq_ignore_ascii_case("tx") && !key.trim().is_empty() {
+        Ok(())
     } else {
-        // Default to tx collection
-        Ok(("tx".to_string(), input.to_string()))
+        Err(Error::InvalidActionArgument {
+            action: "setvar".into(),
+            message: "expected TX followed by a nonempty member name".into(),
+        })
+    }
+}
+
+/// Coraza classifies the entire value after macro expansion.
+pub(crate) enum SetVarOperand {
+    Text,
+    Add(i64),
+    Subtract(i64),
+    Unresolved,
+}
+
+impl SetVarOperand {
+    pub(crate) fn parse(value: &[u8]) -> Self {
+        let [sign @ (b'+' | b'-'), rest @ ..] = value else {
+            return Self::Text;
+        };
+        let n = if rest.is_empty() {
+            0
+        } else if let Some(n) = std::str::from_utf8(rest)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            n
+        } else if rest.starts_with(b"tx.") {
+            return Self::Unresolved;
+        } else {
+            return Self::Text;
+        };
+        if *sign == b'+' {
+            Self::Add(n)
+        } else {
+            Self::Subtract(n)
+        }
     }
 }
 

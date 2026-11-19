@@ -16,7 +16,7 @@ use zentinel_modsec::ModSecurity;
 
 /// Rule IDs that matched, in order.
 fn matched(rules: &str) -> Vec<String> {
-    let m = ModSecurity::from_string(&format!("SecRuleEngine On\n{rules}")).expect("rules load");
+    let m = load_with_request_body(&format!("SecRuleEngine On\n{rules}")).expect("rules load");
     let mut tx = m.new_transaction();
     tx.process_uri("/api", "POST", "HTTP/1.1").unwrap();
     tx.add_request_header("Host", "example.com").unwrap();
@@ -31,7 +31,7 @@ fn matched(rules: &str) -> Vec<String> {
 
 /// Whether the transaction was interrupted.
 fn blocks(rules: &str) -> bool {
-    let m = ModSecurity::from_string(&format!("SecRuleEngine On\n{rules}")).expect("rules load");
+    let m = load_with_request_body(&format!("SecRuleEngine On\n{rules}")).expect("rules load");
     let mut tx = m.new_transaction();
     tx.process_uri("/docs/report.pdf", "POST", "HTTP/1.1")
         .unwrap();
@@ -278,9 +278,16 @@ fn an_unimplemented_variable_is_classified_as_such() {
     assert!(VariableName::RequestLine.is_implemented());
     assert!(VariableName::RequestBasename.is_implemented());
     assert!(VariableName::ArgsCombinedSize.is_implemented());
-    // `XML:` resolves against the flattened XML body; see tests/xml_targets.rs.
+    // XML selectors read independent text/attribute collections.
     assert!(VariableName::Xml.is_implemented());
-    // Still unimplemented; a rule targeting only these is reported at load time.
-    assert!(!VariableName::UniqueId.is_implemented());
-    assert!(!VariableName::FilesCombinedSize.is_implemented());
+    assert!(VariableName::FilesCombinedSize.is_implemented());
+    assert!(VariableName::TimeYear.is_implemented());
+    // Still unimplemented; selecting this variable produces a load warning.
+    assert!(!VariableName::RemoteUser.is_implemented());
+}
+
+// These positive body fixtures explicitly request inspection; the engine's
+// bare defaults match Coraza and leave body access off.
+fn load_with_request_body(config: &str) -> zentinel_modsec::Result<ModSecurity> {
+    ModSecurity::from_string(&format!("SecRequestBodyAccess On\n{config}"))
 }

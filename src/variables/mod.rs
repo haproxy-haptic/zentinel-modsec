@@ -3,14 +3,29 @@
 //! This module handles variable resolution and collection management.
 
 mod collection;
-mod json;
+pub(crate) mod json;
+pub(crate) const DEFAULT_ARGUMENT_LIMIT: usize = 1000;
+mod multipart;
 mod request;
 mod resolver;
 mod response;
+mod selectors;
 mod tx;
+mod value;
+mod widths;
+mod xml;
+mod xml_entities;
 
-pub use collection::{Collection, HashMapCollection, MutableCollection};
+pub(crate) use collection::folded_key;
+pub use collection::{ByteCollection, Collection, HashMapCollection, MutableCollection};
 pub use request::RequestData;
+pub(crate) use resolver::ConnectorMetadata;
 pub use resolver::VariableResolver;
-pub use response::ResponseData;
+pub use response::{ResponseData, ResponseJson};
+pub(crate) use selectors::{
+    compile_selector, regex_exclusion, MemberSelector, SelectorPrograms, TargetSelection,
+};
 pub use tx::TxCollection;
+pub(crate) use value::qualified_name;
+pub use value::ByteValue;
+pub(crate) use widths::Widths;

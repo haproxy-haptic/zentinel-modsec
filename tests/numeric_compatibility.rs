@@ -1,0 +1,235 @@
+use zentinel_modsec::{
+    operators::{EqOperator, GeOperator, GtOperator, LeOperator, LtOperator, Operator},
+    ModSecurity,
+};
+
+#[test]
+fn numeric_operators_use_pinned_integer_conversion_on_both_sides() {
+    for (raw, number) in [
+        (b"".as_slice(), 0),
+        (b"abc", 0),
+        (b"123abc", 0),
+        (b" 1", 0),
+        (b"1 ", 0),
+        (b"+1", 1),
+        (b"-1", -1),
+        (b"1.9", 0),
+        (b"1e2", 0),
+        (b"0x10", 0),
+        (b"\xff", 0),
+        (b"9223372036854775808", i64::MAX),
+        (b"-9223372036854775809", i64::MIN),
+        (b"9223372036854775808x", 0),
+        (b"18446744073709551616x", i64::MAX),
+        (b"-18446744073709551616x", i64::MIN),
+    ] {
+        let target = number.to_string();
+        let ops: Vec<(Box<dyn Operator>, bool)> = vec![
+            (Box::new(EqOperator::new(&target)), true),
+            (Box::new(GtOperator::new(&target)), false),
+            (Box::new(LtOperator::new(&target)), false),
+            (Box::new(GeOperator::new(&target)), true),
+            (Box::new(LeOperator::new(&target)), true),
+        ];
+        for (op, expected) in ops {
+            assert_eq!(op.numeric_comparison().unwrap().matches(raw), expected);
+            let result = op.execute_bytes(raw).unwrap();
+            assert_eq!(result.matched, expected, "{} {:?}", op.name(), raw);
+            if expected {
+                assert_eq!(result.matched_value.as_deref(), Some(raw));
+            }
+            if let Ok(text) = std::str::from_utf8(raw) {
+                assert_eq!(op.execute(text).matched, expected);
+            }
+        }
+    }
+    for argument in ["", "abc", "1.5", " 1", "1x"] {
+        assert!(EqOperator::new(argument).execute("0").matched);
+        assert!(GtOperator::new(argument).execute("1").matched);
+        assert!(LtOperator::new(argument).execute("-1").matched);
+    }
+}
+
+#[test]
+fn empty_numeric_scalars_and_negation_preserve_benign_requests() {
+    // Exact blocking rule from pinned @coraza.conf-recommended. Empty initial
+    // MULTIPART_STRICT_ERROR must compare as zero, including on nonmultipart.
+    let engine=ModSecurity::from_string(r#"SecRuleEngine On
+SecRequestBodyAccess On
+SecRule MULTIPART_STRICT_ERROR "!@eq 0" "id:200003,phase:2,t:none,log,deny,msg:'Multipart request body failed strict validation.'"
+SecRule ARGS:x "@eq 0" "id:10,phase:2,pass"
+SecRule ARGS:x "!@eq 0" "id:11,phase:2,pass"
+SecRule ARGS:x "@eq %{ARGS.target}" "id:12,phase:2,pass""#).unwrap();
+    for (ct, body) in [
+        ("", b"".as_slice()),
+        ("application/x-www-form-urlencoded", b"name=alice"),
+        ("application/json", b"{\"name\":\"alice\"}"),
+        ("application/xml", b"<name>alice</name>"),
+        (
+            "multipart/form-data; boundary=abc",
+            b"--abc\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n--abc--\r\n",
+        ),
+    ] {
+        let mut tx = engine.new_transaction();
+        tx.process_uri(
+            "/?x=&target=abc",
+            if body.is_empty() { "GET" } else { "POST" },
+            "HTTP/1.1",
+        )
+        .unwrap();
+        if !ct.is_empty() {
+            tx.add_request_header("Content-Type", ct).unwrap();
+        }
+        tx.process_request_headers().unwrap();
+        tx.append_request_body(body).unwrap();
+        tx.process_request_body().unwrap();
+        assert!(
+            tx.intervention().is_none(),
+            "{ct}: {:?}",
+            tx.matched_rules()
+        );
+        assert_eq!(tx.matched_rules(), ["10", "12"]);
+    }
+}
+
+#[test]
+fn expanded_operands_use_the_same_conversion_as_values() {
+    use zentinel_modsec::operators::compile_operator_bytes;
+    use zentinel_modsec::parser::{OperatorName, OperatorSpec};
+    for (name, input, expected) in [
+        (OperatorName::Eq, "0", true),
+        (OperatorName::Gt, "1", true),
+        (OperatorName::Ge, "0", true),
+        (OperatorName::Lt, "-1", true),
+        (OperatorName::Le, "1", false),
+    ] {
+        let spec = OperatorSpec {
+            name,
+            argument: "%{tx.target}".into(),
+            negated: false,
+        };
+        for expanded in [&b"invalid"[..], &b"\xff"[..]] {
+            let op = compile_operator_bytes(&spec, expanded).unwrap();
+            assert_eq!(op.execute(input).matched, expected);
+        }
+    }
+}
+
+#[test]
+fn numeric_audit_and_capture_preserve_each_original_or_transformed_operand() {
+    use zentinel_modsec::variables::ByteCollection;
+
+    for target in ["0", "%{tx.limit}"] {
+        let rules = format!(
+            r#"SecRuleEngine DetectionOnly
+SecAction "id:1,phase:1,pass,setvar:tx.limit=0"
+SecRule ARGS:x "@eq {target}" "id:2,phase:1,pass,t:lowercase,multiMatch,capture,setvar:tx.count=+1"
+SecRule ARGS:x "!@eq 9" "id:3,phase:1,pass""#
+        );
+        let engine = ModSecurity::from_string(&rules).unwrap();
+        for (encoded, original) in [
+            ("%FFCAT".to_owned(), b"\xffCAT".to_vec()),
+            ("MixedCase".repeat(512), b"MixedCase".repeat(512)),
+        ] {
+            let mut tx = engine.new_transaction();
+            tx.process_uri(&format!("/?x={encoded}"), "GET", "HTTP/1.1")
+                .unwrap();
+            tx.process_request_headers().unwrap();
+            let records = tx.matched_data();
+            let positive = records
+                .iter()
+                .find(|r| r.rule_id.as_deref() == Some("2"))
+                .unwrap();
+            let negated = records
+                .iter()
+                .find(|r| r.rule_id.as_deref() == Some("3"))
+                .unwrap();
+            assert_eq!(positive.value_bytes, original);
+            assert_eq!(
+                positive.matched_portion_bytes.as_deref(),
+                Some(original.as_slice())
+            );
+            assert_eq!(negated.value_bytes, original);
+            assert_eq!(negated.matched_portion_bytes, None);
+            assert_eq!(tx.tx().get_bytes(b"count"), Some(vec![b"2".as_slice()]));
+            assert_eq!(
+                tx.tx().get_bytes(b"0"),
+                Some(vec![original.to_ascii_lowercase().as_slice()])
+            );
+        }
+    }
+}
+
+#[test]
+fn literal_tx_numeric_rules_preserve_captures_counts_updates_and_removals() {
+    use zentinel_modsec::variables::ByteCollection;
+
+    let rules = r#"SecRuleEngine DetectionOnly
+SecRule TX:CoDe "@eq 0" "id:1,phase:1,pass,TRANSFORMcapture,multiMatch,setvar:tx.seen=%{MATCHED_VAR},setvar:tx.code=4,chain"
+SecRule TX:code "@eq 4" "TRANSFORMsetvar:tx.child=1"
+SecRule &TX:missing "@eq 0" "id:2,phase:1,pass,TRANSFORMmsg:'missing'"
+SecRule TX:missing "!@eq 7" "id:3,phase:1,pass,TRANSFORMmsg:'missing'"
+SecRule &TX:CODE "@eq 1" "id:4,phase:1,pass,TRANSFORMmsg:'present'"
+SecRule TX:code "!@eq 9" "id:5,phase:1,pass,TRANSFORMmsg:'changed'"
+SecAction "id:6,phase:1,pass,ctl:ruleRemoveTargetById=7;TX:code,ctl:ruleRemoveTargetByTag=review;TX:code"
+SecRule TX:code "@eq 4" "id:7,phase:1,pass,TRANSFORMmsg:'id exclusion'"
+SecRule TX:code "@eq 4" "id:8,phase:1,pass,TRANSFORMtag:'review'"
+SecRule TX:code "@eq 4" "id:9,phase:1,pass,TRANSFORMmsg:'retained'""#;
+    let raw = b"\xfftext".as_slice();
+    let mut observed = Vec::new();
+    // Both pipelines preserve the fixture bytes. The nonempty pipeline uses
+    // the general collection resolver and numeric operator path.
+    for transform in ["", "t:removeNulls,"] {
+        let engine = ModSecurity::from_string(&rules.replace("TRANSFORM", transform)).unwrap();
+        let mut tx = engine.new_transaction();
+        tx.tx_mut().set_bytes("code", raw);
+        tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+        assert_eq!(tx.matched_rules(), ["1", "2", "4", "5", "6", "9"]);
+        assert_eq!(tx.tx().get_bytes(b"0"), Some(vec![raw]));
+        assert_eq!(tx.tx().get_bytes(b"seen"), Some(vec![raw]));
+        assert_eq!(tx.tx().get_bytes(b"child"), Some(vec![b"1".as_slice()]));
+        assert!(tx
+            .matched_data()
+            .iter()
+            .any(|r| r.matched_portion_bytes.as_deref() == Some(raw)));
+        let negated = tx
+            .matched_data()
+            .iter()
+            .find(|r| r.rule_id.as_deref() == Some("5"))
+            .unwrap();
+        assert_eq!(negated.value_bytes, b"4");
+        assert_eq!(negated.matched_portion_bytes, None);
+        observed.push(tx.matched_data().to_vec());
+    }
+    assert_eq!(observed[0], observed[1]);
+}
+
+#[test]
+fn repeated_numeric_tx_reads_follow_replacements_and_shifted_positions() {
+    use zentinel_modsec::variables::{MutableCollection, TxCollection};
+    let engine = ModSecurity::from_string(
+        r#"SecAction "id:1,phase:1,pass,setvar:tx.first=6,setvar:tx.score=1,setvar:tx.other=2"
+SecRule TX:SCORE "@eq 1" "id:2,phase:1,pass,setvar:!tx.first"
+SecRule TX:SCORE "@eq 1" "id:3,phase:1,pass,setvar:tx.score=5"
+SecRule TX:OTHER "@eq 2" "id:4,phase:1,pass"
+SecRule TX:SCORE "@eq 5" "id:5,phase:1,pass,setvar:!tx.score"
+SecRule &TX:SCORE "@eq 0" "id:6,phase:1,pass,setvar:tx.score=9"
+SecRule TX:SCORE "@eq 9" "id:7,phase:1,pass"
+SecRule TX:SCORE "@eq 3" "id:8,phase:2,pass,capture"
+SecRule TX:SCORE "@eq 9" "id:9,phase:2,pass""#,
+    )
+    .unwrap();
+    let mut tx = engine.new_transaction();
+    tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+    tx.process_request_headers().unwrap();
+    assert_eq!(tx.matched_rules(), ["1", "2", "3", "4", "5", "6", "7"]);
+    let mut replacement = TxCollection::new();
+    replacement.set("other".into(), "9".into());
+    replacement.set("extra".into(), "9".into());
+    replacement.set("score".into(), "3".into());
+    *tx.tx_mut() = replacement;
+    tx.process_request_body().unwrap();
+    assert_eq!(tx.matched_rules().last().unwrap(), "8");
+    assert_eq!(tx.matched_data().last().unwrap().value_bytes, b"3");
+}

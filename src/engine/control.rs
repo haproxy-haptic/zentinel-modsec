@@ -20,7 +20,9 @@
 //! them: rejecting those would make CRS unloadable, which is a worse
 //! outcome than running it with a known and stated gap.
 
+use crate::variables::{compile_selector, folded_key, SelectorPrograms};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::parser::{ControlAction, Selection, VariableSpec};
 
@@ -36,15 +38,15 @@ pub struct RuleIdRange {
     end: u64,
 }
 
-impl RuleIdRange {
-    fn contains(&self, id: &str) -> bool {
-        match id.trim().parse::<u64>() {
-            Ok(n) => n >= self.start && n <= self.end,
-            // Non-numeric rule IDs are legal in SecLang but cannot fall inside
-            // a numeric range.
-            Err(_) => false,
-        }
-    }
+/// Transaction audit mode selected by a rule for use by the connector's writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditEngineMode {
+    /// Record all transactions.
+    On,
+    /// Suppress the audit record.
+    Off,
+    /// Select transactions using matched audit actions and relevant status.
+    RelevantOnly,
 }
 
 /// A parsed `ctl:` directive.
@@ -52,8 +54,14 @@ impl RuleIdRange {
 pub enum CtlDirective {
     /// `ctl:ruleEngine=On|Off|DetectionOnly`
     RuleEngine(RuleEngineMode),
+    /// Override the connector's audit policy for this transaction.
+    AuditEngine(AuditEngineMode),
+    /// Replace, add, or remove parts of the audit record.
+    AuditLogParts(String),
     /// `ctl:ruleRemoveById=ID` or `=START-END`, or several separated by commas.
     RuleRemoveById(Vec<RuleIdRange>),
+    /// `ctl:ruleRemoveByTag=TAG` (exact, case-sensitive rule tag).
+    RuleRemoveByTag(String),
     /// `ctl:ruleRemoveTargetById=ID;TARGET`
     RuleRemoveTargetById {
         /// ID of the rule the exclusion applies to.
@@ -61,10 +69,29 @@ pub enum CtlDirective {
         /// Target to drop from that rule, e.g. `ARGS:token`.
         target: String,
     },
+    /// `ctl:ruleRemoveTargetByTag=TAG;TARGET` (exact, case-sensitive tag).
+    RuleRemoveTargetByTag {
+        /// Rule tag to select.
+        tag: String,
+        /// Target to drop from the selected rules.
+        target: String,
+    },
     /// `ctl:requestBodyAccess=On|Off`
     RequestBodyAccess(bool),
-    /// `ctl:requestBodyProcessor=URLENCODED|MULTIPART|JSON|XML`
+    /// `ctl:responseBodyAccess=On|Off`
+    ResponseBodyAccess(bool),
+    /// Local request inspection threshold in bytes.
+    RequestBodyLimit(usize),
+    /// Local response inspection threshold in bytes.
+    ResponseBodyLimit(usize),
+    /// `ctl:requestBodyProcessor=URLENCODED|MULTIPART|JSON|XML|RAW`
     RequestBodyProcessor(String),
+    /// `ctl:responseBodyProcessor=JSON`
+    ResponseBodyProcessorJson,
+    /// Expose an otherwise unprocessed body (Coraza 3.8.1 uses URLENCODED).
+    ForceRequestBodyVariable(bool),
+    /// Bypass the response MIME allowlist; body access and size limits still apply.
+    ForceResponseBodyVariable(bool),
     /// A directive this engine does not implement.
     ///
     /// Kept as a distinct variant so it can be reported rather than discarded.
@@ -79,7 +106,7 @@ pub enum CtlDirective {
 }
 
 /// Body processors this engine can actually run.
-const SUPPORTED_BODY_PROCESSORS: &[&str] = &["URLENCODED", "MULTIPART", "JSON", "XML"];
+const SUPPORTED_BODY_PROCESSORS: &[&str] = &["URLENCODED", "MULTIPART", "JSON", "XML", "RAW"];
 
 impl CtlDirective {
     /// Interpret a parsed `ctl:` action.
@@ -111,10 +138,52 @@ impl CtlDirective {
                 ),
             },
 
+            "ruleremovebytag" => {
+                // Coraza splits any optional collection suffix before
+                // dispatching ctl actions. It validates a regex key there,
+                // but whole-rule removal always selects by the tag alone.
+                let (tag, suffix) = action.value.split_once(';').unwrap_or((&action.value, ""));
+                if let Some((_, key)) = suffix.split_once(':') {
+                    let key = key.trim();
+                    if let Some(pattern) = key.strip_prefix('/').and_then(|p| p.strip_suffix('/')) {
+                        let escaped = pattern
+                            .as_bytes()
+                            .iter()
+                            .rev()
+                            .take_while(|b| **b == b'\\')
+                            .count()
+                            % 2
+                            == 1;
+                        if !escaped && (pattern.is_empty() || regex::Regex::new(pattern).is_err()) {
+                            return Self::unsupported(
+                                directive,
+                                value,
+                                "ruleRemoveByTag has an invalid ctl collection-key regex",
+                            );
+                        }
+                    }
+                }
+                Self::RuleRemoveByTag(tag.to_owned())
+            }
+
             "ruleremovetargetbyid" => match value.split_once(';') {
                 Some((rule_id, target))
                     if !rule_id.trim().is_empty() && !target.trim().is_empty() =>
                 {
+                    let Ok(spec) = crate::parser::parse_single_variable(target.trim()) else {
+                        return Self::unsupported(
+                            directive,
+                            value,
+                            "ruleRemoveTargetById has an invalid target",
+                        );
+                    };
+                    if rule_id.trim().parse::<u64>().is_err()
+                        || spec.count_mode
+                        || matches!(spec.selection, Some(Selection::Regex(_)))
+                    {
+                        return Self::unsupported(directive, value,
+                            "ruleRemoveTargetById requires one numeric ID and a literal, non-count target; regex keys are not implemented for this control");
+                    }
                     CtlDirective::RuleRemoveTargetById {
                         rule_id: rule_id.trim().to_string(),
                         target: target.trim().to_string(),
@@ -127,6 +196,69 @@ impl CtlDirective {
                 ),
             },
 
+            "ruleremovetargetbytag" => {
+                let Some((tag, target)) = value.split_once(';') else {
+                    return Self::unsupported(
+                        directive,
+                        value,
+                        "ruleRemoveTargetByTag expects TAG;TARGET",
+                    );
+                };
+                let (tag, target) = (tag.trim(), target.trim());
+                if tag.is_empty() || target.is_empty() || target.contains('|') {
+                    return Self::unsupported(
+                        directive,
+                        value,
+                        "ruleRemoveTargetByTag expects a nonempty tag and one target",
+                    );
+                }
+                let Ok(spec) = crate::parser::parse_single_variable(target) else {
+                    return Self::unsupported(
+                        directive,
+                        value,
+                        "ruleRemoveTargetByTag target is not a supported variable",
+                    );
+                };
+                if spec.count_mode {
+                    return Self::unsupported(
+                        directive,
+                        value,
+                        "ruleRemoveTargetByTag target cannot use count mode",
+                    );
+                }
+                if let Some(Selection::Regex(pattern)) = &spec.selection {
+                    if compile_selector(pattern, spec.name).is_err() {
+                        return Self::unsupported(
+                            directive,
+                            value,
+                            "ruleRemoveTargetByTag target has an invalid regex",
+                        );
+                    }
+                }
+                CtlDirective::RuleRemoveTargetByTag {
+                    tag: tag.to_string(),
+                    target: target.to_string(),
+                }
+            }
+
+            "requestbodylimit" | "responsebodylimit" => {
+                let Some(limit) = value
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|n| usize::try_from(n).ok())
+                else {
+                    return Self::unsupported(
+                        directive,
+                        value,
+                        "body limit must be a nonnegative integer",
+                    );
+                };
+                if directive.eq_ignore_ascii_case("requestbodylimit") {
+                    Self::RequestBodyLimit(limit)
+                } else {
+                    Self::ResponseBodyLimit(limit)
+                }
+            }
             "requestbodyaccess" => match value.to_ascii_lowercase().as_str() {
                 "on" => CtlDirective::RequestBodyAccess(true),
                 "off" => CtlDirective::RequestBodyAccess(false),
@@ -137,6 +269,42 @@ impl CtlDirective {
                 ),
             },
 
+            "forcerequestbodyvariable" => match value.to_ascii_lowercase().as_str() {
+                "on" => Self::ForceRequestBodyVariable(true),
+                "off" => Self::ForceRequestBodyVariable(false),
+                _ => Self::unsupported(
+                    directive,
+                    value,
+                    "forceRequestBodyVariable accepts only On or Off",
+                ),
+            },
+            "forceresponsebodyvariable" => match value.to_ascii_lowercase().as_str() {
+                "on" => Self::ForceResponseBodyVariable(true),
+                "off" => Self::ForceResponseBodyVariable(false),
+                _ => Self::unsupported(
+                    directive,
+                    value,
+                    "forceResponseBodyVariable accepts only On or Off",
+                ),
+            },
+            "responsebodyaccess" => match value.to_ascii_lowercase().as_str() {
+                "on" => CtlDirective::ResponseBodyAccess(true),
+                "off" => CtlDirective::ResponseBodyAccess(false),
+                _ => CtlDirective::unsupported(
+                    directive,
+                    value,
+                    "responseBodyAccess accepts only On or Off",
+                ),
+            },
+
+            "responsebodyprocessor" if value.eq_ignore_ascii_case("json") => {
+                Self::ResponseBodyProcessorJson
+            }
+            "responsebodyprocessor" => Self::unsupported(
+                directive,
+                value,
+                "only the JSON response processor is supported",
+            ),
             "requestbodyprocessor" => {
                 let upper = value.to_ascii_uppercase();
                 if SUPPORTED_BODY_PROCESSORS.contains(&upper.as_str()) {
@@ -146,16 +314,27 @@ impl CtlDirective {
                         directive,
                         value,
                         "requestBodyProcessor accepts only URLENCODED, MULTIPART, \
-                         JSON or XML",
+                         JSON, XML or RAW",
                     )
                 }
             }
 
-            "auditengine" | "auditlogparts" => CtlDirective::unsupported(
-                directive,
-                value,
-                "this engine has no audit log subsystem, so there is nothing to control",
-            ),
+            "auditengine" => match value.to_ascii_lowercase().as_str() {
+                "off" => Self::AuditEngine(AuditEngineMode::Off),
+                "on" => Self::AuditEngine(AuditEngineMode::On),
+                "relevantonly" => Self::AuditEngine(AuditEngineMode::RelevantOnly),
+                _ => Self::unsupported(directive, value, "expected On, Off, or RelevantOnly"),
+            },
+            "auditlogparts" => {
+                let letters = value
+                    .strip_prefix(['+', '-'])
+                    .or_else(|| value.strip_prefix('A')?.strip_suffix('Z'));
+                if letters.is_some_and(|parts| parts.bytes().all(|p| (b'B'..=b'K').contains(&p))) {
+                    Self::AuditLogParts(value.to_owned())
+                } else {
+                    Self::unsupported(directive, value, "invalid audit log parts")
+                }
+            }
 
             _ => CtlDirective::unsupported(directive, value, "unrecognised ctl directive"),
         }
@@ -168,6 +347,14 @@ impl CtlDirective {
             reason,
         }
     }
+}
+
+/// How a logical rule's active tag controls restrict a given collection.
+#[derive(PartialEq, Eq)]
+pub(super) enum TagTargetRemoval {
+    None,
+    Members,
+    All,
 }
 
 /// Parse `942100`, `942100-942999`, or a comma-separated mix of the two.
@@ -204,15 +391,27 @@ fn parse_id_ranges(value: &str) -> Option<Vec<RuleIdRange>> {
 #[derive(Debug, Default, Clone)]
 pub struct TransactionControls {
     engine_mode: Option<RuleEngineMode>,
+    pub(super) audit_engine: Option<AuditEngineMode>,
+    audit_log_parts: Vec<String>,
+    response_body_access: Option<bool>,
+    // Sorted, disjoint inclusive intervals for all active ruleRemoveById controls.
     removed_rules: Vec<RuleIdRange>,
+    removed_tags: Vec<String>,
     /// `(rule id, parsed target)` pairs from `ctl:ruleRemoveTargetById`.
     ///
     /// The target is parsed once when the directive fires rather than once per
     /// resolved value: a rule over a large collection would otherwise re-parse
     /// the same string thousands of times.
     removed_targets: Vec<(String, VariableSpec)>,
+    /// Parsed tag targets and, for regex keys, the compiled key matcher.
+    removed_tag_targets: Vec<(String, VariableSpec, Option<Arc<regex::bytes::Regex>>)>,
     request_body_access: Option<bool>,
+    pub(crate) request_body_limit: Option<usize>,
+    pub(crate) response_body_limit: Option<usize>,
     request_body_processor: Option<String>,
+    response_json: bool,
+    force_request_body_variable: bool,
+    force_response_body_variable: bool,
     /// Unsupported directives already reported, so a rule that fires on every
     /// request does not produce a warning per request.
     reported: HashSet<String>,
@@ -225,15 +424,34 @@ impl TransactionControls {
     /// removals accumulate, since `ctl:ruleRemoveById` is additive in
     /// ModSecurity.
     pub fn apply(&mut self, directive: CtlDirective) {
+        self.apply_compiled(directive, None, false);
+    }
+
+    pub(crate) fn apply_compiled(
+        &mut self,
+        directive: CtlDirective,
+        programs: Option<&SelectorPrograms>,
+        multiphase: bool,
+    ) {
         match directive {
             CtlDirective::RuleEngine(mode) => self.engine_mode = Some(mode),
-            CtlDirective::RuleRemoveById(mut ranges) => self.removed_rules.append(&mut ranges),
+            CtlDirective::AuditEngine(mode) => self.audit_engine = Some(mode),
+            CtlDirective::AuditLogParts(change) => self.audit_log_parts.push(change),
+            CtlDirective::RuleRemoveById(ranges) => self.add_removed_ids(ranges),
+            CtlDirective::RuleRemoveByTag(tag) => {
+                if !self.removed_tags.contains(&tag) {
+                    self.removed_tags.push(tag);
+                }
+            }
             CtlDirective::RuleRemoveTargetById { rule_id, target } => {
                 // Parse with the same parser used for rule variables so
                 // collection names round-trip: SecLang writes REQUEST_HEADERS
                 // where the enum variant renders as RequestHeaders.
                 match crate::parser::parse_single_variable(&target) {
-                    Ok(spec) => self.removed_targets.push((rule_id, spec)),
+                    Ok(spec) => self.removed_targets.extend(
+                        super::ruleset::split_target(spec, multiphase)
+                            .map(|target| (rule_id.clone(), target)),
+                    ),
                     Err(_) => {
                         let key = format!("ruleRemoveTargetById={rule_id};{target}");
                         if self.reported.insert(key) {
@@ -246,8 +464,42 @@ impl TransactionControls {
                     }
                 }
             }
+            CtlDirective::RuleRemoveTargetByTag { tag, target } => {
+                // Normal loading validates these in CtlDirective::parse.
+                // Direct callers receive a visible warning for malformed input.
+                match crate::parser::parse_single_variable(&target) {
+                    Ok(spec) if !spec.count_mode => {
+                        let regex = match &spec.selection {
+                            Some(Selection::Regex(pattern)) => {
+                                let compiled = if let Some(programs) = programs {
+                                    programs.get(pattern, spec.name).cloned()
+                                } else {
+                                    compile_selector(pattern, spec.name).ok().map(Arc::new)
+                                };
+                                if compiled.is_none() {
+                                    tracing::warn!(%tag, %target, "invalid ctl:ruleRemoveTargetByTag target");
+                                    return;
+                                }
+                                compiled
+                            }
+                            _ => None,
+                        };
+                        self.removed_tag_targets.extend(
+                            super::ruleset::split_target(spec, multiphase)
+                                .map(|target| (tag.clone(), target, regex.clone())),
+                        );
+                    }
+                    _ => tracing::warn!(%tag, %target, "invalid ctl:ruleRemoveTargetByTag target"),
+                }
+            }
+            CtlDirective::RequestBodyLimit(n) => self.request_body_limit = Some(n),
+            CtlDirective::ResponseBodyLimit(n) => self.response_body_limit = Some(n),
             CtlDirective::RequestBodyAccess(on) => self.request_body_access = Some(on),
+            CtlDirective::ResponseBodyAccess(on) => self.response_body_access = Some(on),
+            CtlDirective::ResponseBodyProcessorJson => self.response_json = true,
             CtlDirective::RequestBodyProcessor(p) => self.request_body_processor = Some(p),
+            CtlDirective::ForceResponseBodyVariable(on) => self.force_response_body_variable = on,
+            CtlDirective::ForceRequestBodyVariable(on) => self.force_request_body_variable = on,
             CtlDirective::Unsupported {
                 directive,
                 value,
@@ -275,13 +527,66 @@ impl TransactionControls {
         self.engine_mode.unwrap_or(ruleset_mode)
     }
 
+    pub(super) fn audit_log_parts(&self, base: &str) -> String {
+        let mut selected = base.to_owned();
+        for change in &self.audit_log_parts {
+            let add = change.starts_with('+');
+            if add || change.starts_with('-') {
+                // Coraza canonicalizes relative edits to the ordered optional parts.
+                selected = ('B'..='K')
+                    .filter(|&part| {
+                        if change[1..].contains(part) {
+                            add
+                        } else {
+                            selected.contains(part)
+                        }
+                    })
+                    .collect();
+            } else {
+                selected.clone_from(change);
+            }
+        }
+        selected
+    }
+
+    fn add_removed_ids(&mut self, mut ranges: Vec<RuleIdRange>) {
+        // A list normally arrives in one directive. Sorting it once also
+        // lets an empty transaction grow the interval table from the end.
+        ranges.sort_unstable_by_key(|r| r.start);
+        for mut added in ranges {
+            let first = self
+                .removed_rules
+                .partition_point(|r| r.end.saturating_add(1) < added.start);
+            let count = self.removed_rules[first..]
+                .partition_point(|r| r.start <= added.end.saturating_add(1));
+            if count == 0 {
+                self.removed_rules.insert(first, added);
+            } else {
+                let last = first + count - 1;
+                added.start = added.start.min(self.removed_rules[first].start);
+                added.end = added.end.max(self.removed_rules[last].end);
+                self.removed_rules[first] = added;
+                self.removed_rules.drain(first + 1..=last);
+            }
+        }
+    }
+
     /// Whether `ctl:ruleRemoveById` has excluded this rule.
     pub fn is_rule_removed(&self, rule_id: Option<&str>) -> bool {
-        let Some(id) = rule_id else {
-            // A rule with no ID cannot be named by ruleRemoveById.
+        if self.removed_rules.is_empty() {
+            return false;
+        }
+        let Some(id) = rule_id.and_then(|id| id.trim().parse::<u64>().ok()) else {
             return false;
         };
-        self.removed_rules.iter().any(|r| r.contains(id))
+        let index = self.removed_rules.partition_point(|r| r.end < id);
+        self.removed_rules.get(index).is_some_and(|r| r.start <= id)
+    }
+
+    pub(crate) fn is_tag_removed(&self, actions: &[crate::parser::Action]) -> bool {
+        self.removed_tags
+            .iter()
+            .any(|tag| super::ruleset::has_tag(actions, tag))
     }
 
     /// Whether any target exclusion applies to this rule.
@@ -320,17 +625,116 @@ impl TransactionControls {
         var: &VariableSpec,
         resolved_name: &str,
     ) -> bool {
-        let Some(id) = rule_id else {
-            return false;
-        };
-        self.removed_targets
+        self.is_target_removed_bytes(rule_id, var, resolved_name.as_bytes())
+    }
+
+    /// Whether a tag exclusion selects this rule (or its chain starter).
+    pub fn has_tag_target_removals(&self, actions: &[crate::parser::Action]) -> bool {
+        self.removed_tag_targets
             .iter()
-            .any(|(r, target)| r == id && target_matches_resolved(var, target, resolved_name))
+            .any(|(tag, _, _)| super::ruleset::has_tag(actions, tag))
+    }
+
+    pub(super) fn tag_target_removal(
+        &self,
+        actions: &[crate::parser::Action],
+        var: &VariableSpec,
+    ) -> TagTargetRemoval {
+        let mut removal = TagTargetRemoval::None;
+        for (tag, target, _) in &self.removed_tag_targets {
+            if target.name == var.name && super::ruleset::has_tag(actions, tag) {
+                if target.selection.is_none() {
+                    return TagTargetRemoval::All;
+                }
+                removal = TagTargetRemoval::Members;
+            }
+        }
+        removal
+    }
+
+    /// Whether a value is excluded by an exact matching rule tag.
+    pub fn is_tag_target_removed(
+        &self,
+        actions: &[crate::parser::Action],
+        var: &VariableSpec,
+        resolved_name: &str,
+    ) -> bool {
+        self.is_tag_target_removed_bytes(actions, var, resolved_name.as_bytes())
+    }
+
+    /// Filter an original byte-valued target without matching its display text.
+    pub fn is_target_removed_bytes(
+        &self,
+        rule_id: Option<&str>,
+        var: &VariableSpec,
+        name: &[u8],
+    ) -> bool {
+        self.removed_member(rule_id, var, member(name))
+    }
+
+    pub(crate) fn removed_member(
+        &self,
+        rule_id: Option<&str>,
+        var: &VariableSpec,
+        key: Option<&[u8]>,
+    ) -> bool {
+        rule_id.is_some_and(|id| {
+            self.removed_targets
+                .iter()
+                .any(|(rule, target)| rule == id && target_matches_member(var, target, key, None))
+        })
+    }
+
+    /// Apply tag target exclusions to original collection-key bytes.
+    pub fn is_tag_target_removed_bytes(
+        &self,
+        actions: &[crate::parser::Action],
+        var: &VariableSpec,
+        name: &[u8],
+    ) -> bool {
+        self.removed_tag_member(actions, var, member(name))
+    }
+
+    pub(crate) fn removed_tag_member(
+        &self,
+        actions: &[crate::parser::Action],
+        var: &VariableSpec,
+        key: Option<&[u8]>,
+    ) -> bool {
+        self.removed_tag_targets.iter().any(|(tag, target, regex)| {
+            super::ruleset::has_tag(actions, tag)
+                && target_matches_member(var, target, key, regex.as_deref())
+        })
+    }
+
+    /// Whether a rule selected JSON response processing.
+    pub fn response_json_selected(&self) -> bool {
+        self.response_json
+    }
+
+    /// Whether the response bypasses the configured MIME filter.
+    pub fn force_response_body_variable(&self) -> bool {
+        self.force_response_body_variable
     }
 
     /// Whether the request body should be parsed at all.
     pub fn request_body_access(&self) -> bool {
         self.request_body_access.unwrap_or(true)
+    }
+
+    /// Resolve a request access override against the compiled global policy.
+    pub fn request_body_access_or(&self, configured: bool) -> bool {
+        self.request_body_access.unwrap_or(configured)
+    }
+
+    /// Resolve a response access override against the compiled global policy.
+    pub fn response_body_access_or(&self, configured: bool) -> bool {
+        self.response_body_access.unwrap_or(configured)
+    }
+
+    /// Whether a processor should be selected for an otherwise opaque body.
+    pub fn force_request_body_variable(&self) -> bool {
+        self.force_request_body_variable
     }
 
     /// Body processor forced by `ctl:requestBodyProcessor`, if any.
@@ -339,50 +743,28 @@ impl TransactionControls {
     }
 }
 
-/// Whether a resolved value falls under the target named by a `ctl:` argument
-/// such as `ARGS:bar` or `REQUEST_HEADERS`.
-///
-/// The target is parsed with the same parser used for rule variables so
-/// collection names round-trip: SecLang writes `REQUEST_HEADERS` where the
-/// enum variant renders as `RequestHeaders`, and comparing rendered names
-/// would silently never match.
-fn target_matches_resolved(var: &VariableSpec, target: &VariableSpec, resolved_name: &str) -> bool {
+fn member(name: &[u8]) -> Option<&[u8]> {
+    name.iter().position(|&b| b == b':').map(|i| &name[i + 1..])
+}
+
+fn target_matches_member(
+    var: &VariableSpec,
+    target: &VariableSpec,
+    member: Option<&[u8]>,
+    regex: Option<&regex::bytes::Regex>,
+) -> bool {
     if var.name != target.name {
         return false;
     }
-
     match &target.selection {
-        // `ctl:...=ID;ARGS` excludes the whole collection from this rule.
         None => true,
         Some(Selection::Key(wanted)) => {
-            // The resolver names collection members `COLLECTION:key`. A bare
-            // name means a scalar variable, which a keyed target cannot select.
-            let Some((_, key)) = resolved_name.split_once(':') else {
-                return false;
-            };
-            if header_keys_are_case_insensitive(var) {
-                key.eq_ignore_ascii_case(wanted.as_str())
-            } else {
-                key == wanted.as_str()
-            }
+            member.is_some_and(|key| folded_key(key) == folded_key(wanted.as_bytes()))
         }
-        // A regex selection in a ctl: target is not something ModSecurity
-        // accepts here; refuse rather than guess.
-        Some(Selection::Regex(_)) => false,
+        Some(Selection::Regex(_)) => {
+            member.is_some_and(|key| regex.is_some_and(|re| re.is_match(&folded_key(key))))
+        }
     }
-}
-
-/// Whether member keys of this variable's collection compare case-insensitively.
-///
-/// Only the HTTP header collections do — the resolver looks those up with a
-/// lowercased key. Argument names are case-sensitive in ModSecurity, and
-/// matching them loosely would silently widen an exclusion beyond what the
-/// operator wrote.
-fn header_keys_are_case_insensitive(var: &VariableSpec) -> bool {
-    matches!(
-        var.name,
-        crate::parser::VariableName::RequestHeaders | crate::parser::VariableName::ResponseHeaders
-    )
 }
 
 /// Collect the unsupported `ctl:` directives in a set of actions.
@@ -418,6 +800,29 @@ mod tests {
             directive: directive.to_string(),
             value: value.to_string(),
         }
+    }
+
+    #[test]
+    fn overlapping_adjacent_and_repeated_id_removals_remain_a_union() {
+        let mut state = TransactionControls::default();
+        state.apply(CtlDirective::parse(&ctl(
+            "ruleRemoveById",
+            "20-30,8,0,4-7,18446744073709551615",
+        )));
+        state.apply(CtlDirective::parse(&ctl(
+            "ruleRemoveById",
+            "29-33,8-12,21,18446744073709551614",
+        )));
+        for id in 0..40 {
+            assert_eq!(
+                state.is_rule_removed(Some(&id.to_string())),
+                id == 0 || (4..=12).contains(&id) || (20..=33).contains(&id)
+            );
+        }
+        assert!(state.is_rule_removed(Some(" 0005 ")));
+        assert!(state.is_rule_removed(Some(&u64::MAX.to_string())));
+        assert!(!state.is_rule_removed(Some("named-rule")));
+        assert_eq!(state.removed_rules.len(), 4);
     }
 
     #[test]
@@ -581,10 +986,9 @@ mod tests {
         assert!(!controls.is_target_removed(Some("942100"), &whole_args, "ARGS:json.query"));
     }
 
-    /// Argument names are case sensitive in ModSecurity, unlike header names.
-    /// Matching them loosely would widen an exclusion past what was written.
+    /// Coraza GetField folds the original member name for literal exceptions.
     #[test]
-    fn argument_keys_are_matched_case_sensitively() {
+    fn argument_exclusions_fold_the_observed_member_name() {
         let mut controls = TransactionControls::default();
         controls.apply(CtlDirective::parse(&ctl(
             "ruleRemoveTargetById",
@@ -593,7 +997,7 @@ mod tests {
 
         let args = crate::parser::parse_single_variable("ARGS").unwrap();
         assert!(controls.is_target_removed(Some("1"), &args, "ARGS:Token"));
-        assert!(!controls.is_target_removed(Some("1"), &args, "ARGS:token"));
+        assert!(controls.is_target_removed(Some("1"), &args, "ARGS:token"));
     }
 
     /// A keyed target cannot select a scalar variable, which has no members.
@@ -634,9 +1038,9 @@ mod tests {
         // like it worked.
         for (directive, value) in [
             ("requestBodyProcessor", "YAML"),
-            ("auditEngine", "Off"),
-            ("auditLogParts", "+E"),
-            ("forceRequestBodyVariable", "On"),
+            ("auditEngine", "unknown"),
+            ("auditLogParts", "+Z"),
+            ("forceRequestBodyVariable", "sometimes"),
         ] {
             assert!(
                 matches!(

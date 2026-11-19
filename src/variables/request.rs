@@ -1,12 +1,28 @@
 //! Request data for variable resolution.
 
+use std::sync::OnceLock;
+
+use rand::distr::{Alphabetic, SampleString};
+
 use super::collection::{Collection, HashMapCollection};
-use super::json::JsonNode;
-use std::borrow::Cow;
+use super::ByteValue;
+
+#[derive(Debug, Clone)]
+struct PathArguments {
+    members: HashMapCollection,
+    count: usize,
+}
 
 /// Request data container.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RequestData {
+    /// Generated on first access when the connector did not provide an ID.
+    pub(crate) unique_id: OnceLock<String>,
+    pub(crate) started: std::time::SystemTime,
+    argument_limit: usize,
+    request_json_depth_limit: usize,
+    /// A query or body processor dropped entries at its configured argument limit.
+    pub arguments_limit_reached: bool,
     /// HTTP method.
     pub method: String,
     /// Request URI (with query string).
@@ -19,14 +35,30 @@ pub struct RequestData {
     pub query_string: String,
     /// HTTP protocol version.
     pub protocol: String,
+    /// Original URI bytes when the legacy text field cannot represent them.
+    pub(crate) binary_uri: Option<ByteValue>,
+    normalized_uri: Option<ByteValue>,
+    /// Decoded path bytes when percent decoding produces non-UTF-8 data.
+    pub(crate) binary_path: Option<ByteValue>,
+    /// Original query bytes when the legacy text field cannot represent them.
+    pub(crate) binary_query: Option<ByteValue>,
+    /// Original method bytes when not UTF-8.
+    pub(crate) binary_method: Option<ByteValue>,
+    /// Original protocol bytes when not UTF-8.
+    pub(crate) binary_protocol: Option<ByteValue>,
     /// Request headers.
     pub headers: HashMapCollection,
     /// GET arguments.
     pub args_get: HashMapCollection,
+    /// Named parameters extracted by REST path rules, allocated on first match.
+    args_path: Option<Box<PathArguments>>,
     /// POST arguments.
     pub args_post: HashMapCollection,
     /// Cookies.
     pub cookies: HashMapCollection,
+    /// XML attribute and text values keyed by Coraza's two supported selectors
+    /// (`//@*` and `/*`). XML markup never becomes HTTP argument names.
+    pub xml: HashMapCollection,
     /// Multipart part headers (key = part name, value = full header line),
     /// populated by the multipart body processor. Mirrors ModSecurity's
     /// `MULTIPART_PART_HEADERS` collection.
@@ -34,6 +66,27 @@ pub struct RequestData {
     /// Uploaded files (key = part name, value = client-supplied filename),
     /// populated by the multipart body processor. Backs `FILES`/`FILES_NAMES`.
     pub files: HashMapCollection,
+    pub(crate) uploads: Option<std::sync::Arc<super::multipart::UploadedFiles>>,
+    /// Uploaded field names (one value per file part).
+    pub files_names: HashMapCollection,
+    /// Uploaded payload byte sizes, keyed by the original filename bytes.
+    pub files_sizes: HashMapCollection,
+    /// Sum of multipart field and file payload bytes, excluding framing.
+    pub files_combined_size: usize,
+    /// Multipart field names and all filename interpretations.
+    pub multipart_names: HashMapCollection,
+    /// Filenames keyed by multipart part name.
+    pub multipart_filenames: HashMapCollection,
+    /// Extended filename charsets, without transcoding the filename bytes.
+    pub multipart_filename_charsets: HashMapCollection,
+    /// Extended filename language parameters.
+    pub multipart_filename_languages: HashMapCollection,
+    /// Multipart syntax or parser-disagreement flags.
+    pub multipart_strict_error: bool,
+    /// A duplicate multipart header or conflicting parameter was present.
+    pub multipart_duplicate_part_header: bool,
+    /// An extended filename used invalid quoted-string syntax.
+    pub multipart_invalid_quoting: bool,
     /// Name of the body processor that handled the request body
     /// (`MULTIPART`, `URLENCODED`, `JSON`, or empty when none ran). Backs
     /// `REQBODY_PROCESSOR`.
@@ -46,8 +99,12 @@ pub struct RequestData {
     /// that the origin application happily accepts is a bypass when it
     /// happens quietly.
     pub body_error: Option<String>,
+    /// Raw body variables become visible when phase 2 processes the request.
+    pub(crate) body_processed: bool,
     /// Request body.
     pub body: Vec<u8>,
+    /// Acquisition reached its body limit; a partial body may end mid-part.
+    pub inbound_data_error: bool,
     /// Client IP address.
     pub client_ip: String,
     /// Client port.
@@ -60,56 +117,272 @@ pub struct RequestData {
     pub server_port: u16,
 }
 
+impl Default for RequestData {
+    fn default() -> Self {
+        Self {
+            unique_id: OnceLock::new(),
+            started: std::time::SystemTime::now(),
+            argument_limit: super::DEFAULT_ARGUMENT_LIMIT,
+            request_json_depth_limit: super::json::DEFAULT_DEPTH_LIMIT,
+            arguments_limit_reached: false,
+            method: Default::default(),
+            uri: Default::default(),
+            uri_raw: Default::default(),
+            path: Default::default(),
+            query_string: Default::default(),
+            protocol: Default::default(),
+            binary_uri: Default::default(),
+            normalized_uri: None,
+            binary_path: Default::default(),
+            binary_query: Default::default(),
+            binary_method: Default::default(),
+            binary_protocol: Default::default(),
+            headers: HashMapCollection::named(),
+            args_get: HashMapCollection::named(),
+            args_path: None,
+            args_post: HashMapCollection::named(),
+            cookies: HashMapCollection::named(),
+            xml: HashMapCollection::named(),
+            multipart_part_headers: HashMapCollection::named(),
+            files: HashMapCollection::named(),
+            uploads: None,
+            files_names: HashMapCollection::named(),
+            files_sizes: HashMapCollection::named(),
+            files_combined_size: Default::default(),
+            multipart_names: HashMapCollection::named(),
+            multipart_filenames: HashMapCollection::named(),
+            multipart_filename_charsets: HashMapCollection::named(),
+            multipart_filename_languages: HashMapCollection::named(),
+            multipart_strict_error: Default::default(),
+            multipart_duplicate_part_header: Default::default(),
+            multipart_invalid_quoting: Default::default(),
+            body_processor: Default::default(),
+            body_error: Default::default(),
+            body_processed: true,
+            body: Default::default(),
+            inbound_data_error: Default::default(),
+            client_ip: Default::default(),
+            client_port: Default::default(),
+            server_name: Default::default(),
+            server_addr: Default::default(),
+            server_port: Default::default(),
+        }
+    }
+}
+
 impl RequestData {
     /// Create new request data.
     pub fn new() -> Self {
         Self::default()
     }
 
+    pub(crate) fn path_arguments(&self) -> Option<&HashMapCollection> {
+        self.args_path.as_deref().map(|path| &path.members)
+    }
+
+    fn path_arguments_mut(&mut self) -> &mut PathArguments {
+        self.args_path.get_or_insert_with(|| {
+            Box::new(PathArguments {
+                members: HashMapCollection::named(),
+                count: 0,
+            })
+        })
+    }
+
+    pub(crate) fn add_path_argument(&mut self, name: &[u8], value: &[u8]) {
+        if self
+            .args_path
+            .as_ref()
+            .is_some_and(|path| path.count >= self.argument_limit)
+        {
+            self.arguments_limit_reached = true;
+            return;
+        }
+        let path = self.path_arguments_mut();
+        path.members.add_bytes(name, value);
+        path.count += 1;
+    }
+
+    pub(crate) fn set_route_parameter(&mut self, name: &str, value: &[u8]) {
+        let path = self.path_arguments_mut();
+        if path.members.replace_first_or_add(name.as_bytes(), value) {
+            path.count += 1;
+        }
+    }
+
+    /// The stable transaction identifier exposed to rules as `UNIQUE_ID`.
+    pub fn unique_id(&self) -> &str {
+        self.unique_id
+            .get_or_init(|| Alphabetic.sample_string(&mut rand::rng(), 19))
+    }
+
+    pub(crate) fn with_limits(argument_limit: usize, request_json_depth_limit: usize) -> Self {
+        Self {
+            argument_limit,
+            request_json_depth_limit,
+            body_processed: false,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn argument_limit_flag(&self) -> &'static [u8] {
+        if self.arguments_limit_reached {
+            b"1"
+        } else {
+            b"0"
+        }
+    }
+
     /// Set the URI and parse path/query string.
     pub fn set_uri(&mut self, uri: &str) {
-        self.uri = uri.to_string();
-        self.uri_raw = uri.to_string();
+        self.set_uri_bytes(uri.as_bytes());
+    }
 
-        if let Some(pos) = uri.find('?') {
-            self.path = uri[..pos].to_string();
-            self.query_string = uri[pos + 1..].to_string();
-            self.parse_query_string(&self.query_string.clone());
+    /// Set a request target without replacing invalid UTF-8 or decoded bytes.
+    pub fn set_uri_bytes(&mut self, uri: &[u8]) {
+        self.set_request_target(uri, false);
+    }
+
+    pub(crate) fn set_request_target(&mut self, uri: &[u8], coraza: bool) {
+        let (display, binary) = component_strings(uri);
+        self.uri_raw = display.clone();
+        self.uri = display;
+        self.binary_uri = binary;
+
+        let end = memchr::memchr2(b'?', b'#', uri).unwrap_or(uri.len());
+        let raw_path = &uri[..end];
+        let query = if uri.get(end) == Some(&b'?') {
+            let tail = &uri[end + 1..];
+            &tail[..memchr::memchr(b'#', tail).unwrap_or(tail.len())]
         } else {
-            self.path = uri.to_string();
-            self.query_string.clear();
+            &[]
+        };
+        (self.query_string, self.binary_query) = component_strings(query);
+        self.args_get.clear();
+        self.arguments_limit_reached |=
+            parse_form_bytes(query, &mut self.args_get, self.argument_limit);
+
+        let path = decoded_request_path_bytes(raw_path, coraza);
+        self.normalized_uri = if coraza {
+            coraza_request_uri(uri, raw_path, &path)
+        } else {
+            None
+        };
+        if let Some(normalized) = &self.normalized_uri {
+            normalized.display_text().clone_into(&mut self.uri);
         }
+        match String::from_utf8(path) {
+            Ok(path) => {
+                self.path = path;
+                self.binary_path = None;
+            }
+            Err(error) => {
+                self.binary_path = Some(ByteValue::from(error.into_bytes()));
+                // The public text field historically exposes the undecoded path
+                // when percent decoding produces non-UTF-8.
+                self.path = component_strings(raw_path).0;
+            }
+        }
+    }
+
+    /// Original request target bytes.
+    pub fn uri_bytes(&self) -> &[u8] {
+        self.binary_uri
+            .as_ref()
+            .map_or(self.uri_raw.as_bytes(), ByteValue::as_bytes)
+    }
+    pub(crate) fn request_uri_bytes(&self) -> &[u8] {
+        self.normalized_uri
+            .as_ref()
+            .map_or_else(|| self.uri_bytes(), ByteValue::as_bytes)
+    }
+
+    /// Decoded path bytes, including invalid UTF-8 created by percent decoding.
+    pub fn path_bytes(&self) -> &[u8] {
+        self.binary_path
+            .as_ref()
+            .map_or(self.path.as_bytes(), ByteValue::as_bytes)
+    }
+    /// Original query string bytes.
+    pub fn query_bytes(&self) -> &[u8] {
+        self.binary_query
+            .as_ref()
+            .map_or(self.query_string.as_bytes(), ByteValue::as_bytes)
+    }
+    /// Original HTTP method bytes.
+    pub fn method_bytes(&self) -> &[u8] {
+        self.binary_method
+            .as_ref()
+            .map_or(self.method.as_bytes(), ByteValue::as_bytes)
+    }
+    /// Original HTTP protocol bytes.
+    pub fn protocol_bytes(&self) -> &[u8] {
+        self.binary_protocol
+            .as_ref()
+            .map_or(self.protocol.as_bytes(), ByteValue::as_bytes)
+    }
+    /// Set method bytes; textual presentation is never used for matching.
+    pub fn set_method_bytes(&mut self, value: &[u8]) {
+        (self.method, self.binary_method) = component_strings(value);
+    }
+    /// Set protocol bytes; textual presentation is never used for matching.
+    pub fn set_protocol_bytes(&mut self, value: &[u8]) {
+        (self.protocol, self.binary_protocol) = component_strings(value);
     }
 
     /// Set the HTTP method.
     pub fn set_method(&mut self, method: &str) {
+        self.binary_method = None;
         self.method = method.to_string();
     }
 
     /// Set the protocol.
     pub fn set_protocol(&mut self, protocol: &str) {
+        self.binary_protocol = None;
         self.protocol = protocol.to_string();
     }
 
     /// Add a request header.
     pub fn add_header(&mut self, name: &str, value: &str) {
-        let lower = name.to_lowercase();
-        if lower == "cookie" {
-            self.parse_cookie_header(value);
-        }
-        self.headers.add(lower, value.to_string());
+        self.add_header_bytes(name.as_bytes(), value.as_bytes());
     }
 
-    /// Parse a `Cookie` request header into the cookies collection.
-    fn parse_cookie_header(&mut self, value: &str) {
-        for pair in value.split(';') {
-            let pair = pair.trim();
+    /// Add original header name/value bytes without UTF-8 replacement.
+    pub fn add_header_bytes(&mut self, name: &[u8], value: &[u8]) {
+        let lower = name.to_ascii_lowercase();
+        if lower == b"cookie" {
+            self.parse_cookie_header_bytes(value);
+        }
+        // The first Content-Type selects form processors before phase 1,
+        // including empty bodies. Later duplicate headers must not change it.
+        if lower == b"content-type" && self.headers.first_value_bytes(b"content-type").is_none() {
+            let media = trim_header_leading_space(value);
+            if media.get(..33).is_some_and(|prefix| {
+                prefix.eq_ignore_ascii_case(b"application/x-www-form-urlencoded")
+            }) {
+                self.body_processor = "URLENCODED".into();
+            } else if media
+                .get(..19)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"multipart/form-data"))
+            {
+                self.body_processor = "MULTIPART".into();
+            }
+        }
+        self.headers.add_named_bytes(lower, name, value);
+    }
+
+    fn parse_cookie_header_bytes(&mut self, value: &[u8]) {
+        for pair in value.split(|&b| b == b';') {
+            let pair = trim_ascii(pair);
             if pair.is_empty() {
                 continue;
             }
-            match pair.split_once('=') {
-                Some((k, v)) => self.cookies.add(k.trim().to_string(), v.trim().to_string()),
-                None => self.cookies.add(pair.to_string(), String::new()),
+            let equal = pair.iter().position(|&b| b == b'=');
+            match equal {
+                Some(i) => self
+                    .cookies
+                    .add_bytes(trim_ascii(&pair[..i]), trim_ascii(&pair[i + 1..])),
+                None => self.cookies.add_bytes(pair, &b""[..]),
             }
         }
     }
@@ -124,129 +397,79 @@ impl RequestData {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
+    /// REQUEST_BODY's original bytes, observing processor-specific visibility.
+    pub fn request_body_bytes_variable(&self) -> &[u8] {
+        if self.body_processed && matches!(self.body_processor.as_str(), "URLENCODED" | "RAW") {
+            &self.body
+        } else {
+            b""
+        }
+    }
+
+    /// Public REQUEST_BODY value, distinct from the internally retained bytes.
+    /// Coraza populates it only for the URLENCODED and RAW processors.
+    pub fn request_body_variable(&self) -> String {
+        String::from_utf8_lossy(self.request_body_bytes_variable()).into_owned()
+    }
+
+    /// Structured processors leave REQUEST_BODY_LENGTH at its initial zero.
+    pub fn request_body_length_variable(&self) -> String {
+        self.request_body_bytes_variable().len().to_string()
+    }
+
     /// Get body length.
     pub fn body_length(&self) -> usize {
         self.body.len()
     }
 
-    /// Parse query string into args_get.
-    fn parse_query_string(&mut self, qs: &str) {
-        for pair in qs.split('&') {
-            if let Some(pos) = pair.find('=') {
-                let key = &pair[..pos];
-                let value = &pair[pos + 1..];
-                // URL decode
-                let key = form_decode(key);
-                let value = form_decode(value);
-                self.args_get.add(key, value);
-            } else if !pair.is_empty() {
-                let key = form_decode(pair);
-                self.args_get.add(key, String::new());
-            }
-        }
+    /// Parse multipart without decoding binary fields or filenames as UTF-8.
+    pub fn parse_multipart_body(&mut self, content_type: &str) -> bool {
+        self.parse_multipart_body_bytes(content_type.as_bytes())
     }
 
-    /// Parse a `multipart/form-data` body.
-    ///
-    /// Populates `args_post` from form fields, `files` from file parts, and
-    /// `multipart_part_headers` with every part header line keyed by the part
-    /// name (ModSecurity `MULTIPART_PART_HEADERS` semantics). Returns `false`
-    /// when no boundary parameter can be extracted from the Content-Type.
-    pub fn parse_multipart_body(&mut self, content_type: &str) -> bool {
-        let Some(boundary) = extract_multipart_boundary(content_type) else {
-            return false;
-        };
-        let body = self.body_str();
-        let delimiter = format!("--{boundary}");
+    /// Byte-preserving multipart Content-Type and body processing.
+    /// Returns false when the Content-Type carries no usable boundary; parser
+    /// failures remain visible through body and strict-error variables.
+    pub fn parse_multipart_body_bytes(&mut self, content_type: &[u8]) -> bool {
+        self.parse_multipart(content_type, true, None)
+    }
 
-        let mut sections = body.split(delimiter.as_str());
-        // Everything before the first boundary is preamble; discard it.
-        let _preamble = sections.next();
-
-        for section in sections {
-            if section.starts_with("--") {
-                // Closing delimiter (`--boundary--`); anything after is epilogue.
-                break;
-            }
-            // The boundary line ends with CRLF before the part headers.
-            let section = section
-                .strip_prefix("\r\n")
-                .or_else(|| section.strip_prefix("\n"))
-                .unwrap_or(section);
-
-            // Headers are separated from the part content by a blank line.
-            let (head, content) = match section.split_once("\r\n\r\n") {
-                Some(split) => split,
-                None => match section.split_once("\n\n") {
-                    Some(split) => split,
-                    None => (section, ""),
-                },
-            };
-            // The CRLF before the next boundary belongs to the framing, not
-            // the content.
-            let content = content
-                .strip_suffix("\r\n")
-                .or_else(|| content.strip_suffix("\n"))
-                .unwrap_or(content);
-
-            let mut part_name: Option<String> = None;
-            let mut filename: Option<String> = None;
-            let mut header_lines: Vec<String> = Vec::new();
-
-            for line in head.lines() {
-                let line = line.trim_end_matches('\r');
-                if line.is_empty() {
-                    continue;
-                }
-                header_lines.push(line.to_string());
-                if let Some((hname, hval)) = line.split_once(':') {
-                    if hname.trim().eq_ignore_ascii_case("content-disposition") {
-                        part_name = extract_disposition_param(hval, "name");
-                        filename = extract_disposition_param(hval, "filename");
-                    }
-                }
-            }
-
-            let Some(name) = part_name else {
-                // A part without a Content-Disposition name cannot be
-                // addressed by any collection key; skip it.
-                continue;
-            };
-
-            for line in header_lines {
-                self.multipart_part_headers.add(name.clone(), line);
-            }
-            if let Some(fname) = filename {
-                self.files.add(name, fname);
-            } else {
-                self.args_post.add(name, content.to_string());
-            }
-        }
-
-        self.body_processor = "MULTIPART".to_string();
-        true
+    pub(crate) fn parse_multipart(
+        &mut self,
+        content_type: &[u8],
+        store_uploads: bool,
+        upload_dir: Option<&std::path::Path>,
+    ) -> bool {
+        self.body_processor = "MULTIPART".into();
+        let parsed = super::multipart::parse(
+            &self.body,
+            content_type,
+            self.inbound_data_error,
+            store_uploads,
+            upload_dir,
+        );
+        self.uploads = parsed.uploads.map(std::sync::Arc::new);
+        self.args_post = parsed.fields;
+        self.files = parsed.files;
+        self.files_names = parsed.file_names;
+        self.files_sizes = parsed.file_sizes;
+        self.files_combined_size = parsed.combined_size;
+        self.multipart_part_headers = parsed.headers;
+        self.multipart_names = parsed.names;
+        self.multipart_filenames = parsed.filenames;
+        self.multipart_filename_charsets = parsed.charsets;
+        self.multipart_filename_languages = parsed.languages;
+        self.multipart_strict_error = parsed.strict;
+        self.multipart_duplicate_part_header = parsed.duplicate;
+        self.multipart_invalid_quoting = parsed.invalid_quoting;
+        self.body_error = parsed.error;
+        parsed.has_boundary
     }
 
     /// Parse form body into args_post.
     pub fn parse_form_body(&mut self) {
-        let body_str = self.body_str();
-        for pair in body_str.split('&') {
-            if let Some(pos) = pair.find('=') {
-                let key = &pair[..pos];
-                let value = &pair[pos + 1..];
-                let key = form_decode(key);
-                let value = form_decode(value);
-                self.args_post.add(key, value);
-            } else if !pair.is_empty() {
-                // A parameter with no `=` is a name with an empty value, which
-                // is how application frameworks parse it. Dropping it here was
-                // a bypass: percent-encoding the `=` leaves a body with no
-                // literal separator, so the whole body became invisible to
-                // ARGS and ARGS_NAMES while the origin still saw a parameter.
-                // The query-string parser has always handled this shape.
-                self.args_post.add(form_decode(pair), String::new());
-            }
-        }
+        self.arguments_limit_reached |=
+            parse_form_bytes(&self.body, &mut self.args_post, self.argument_limit);
     }
 
     /// Parse a JSON body into `args_post`, mirroring ModSecurity's JSON
@@ -271,204 +494,40 @@ impl RequestData {
     pub fn parse_json_body(&mut self) -> Result<(), String> {
         self.body_processor = "JSON".to_string();
 
-        // A body that is empty or only whitespace has nothing to inspect, and
-        // is not a parse failure. Clients legitimately send an empty body with
-        // `Content-Type: application/json` on POST and DELETE; reporting that
-        // as an error would make CRS rule 200002 block them.
-        if self.body.iter().all(|b| b.is_ascii_whitespace()) {
-            return Ok(());
-        }
-
-        let value: JsonNode = match serde_json::from_slice(&self.body) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("JSON parsing error: {e}");
-                self.body_error = Some(msg.clone());
-                return Err(msg);
-            }
-        };
-
-        let mut count = 0usize;
-        let mut path = String::from("json");
-        let truncated = flatten_json(&value, &mut path, &mut self.args_post, &mut count, 0);
-
-        if truncated {
-            let msg = format!(
-                "JSON body exceeded processing limits ({MAX_JSON_ARGS} arguments or \
-                 {MAX_JSON_DEPTH} levels of nesting); only part of the body was inspected"
-            );
-            self.body_error = Some(msg.clone());
-            return Err(msg);
-        }
-
-        Ok(())
+        let result = super::json::parse(
+            &self.body,
+            &mut self.args_post,
+            self.argument_limit,
+            self.request_json_depth_limit,
+            &mut self.arguments_limit_reached,
+        );
+        self.body_error = result.as_ref().err().cloned();
+        result
     }
 
-    /// Parse an XML body, flattening element text and attributes into
-    /// `args_post`.
-    ///
-    /// ModSecurity exposes XML through an XPath-selected `XML:` variable. That
-    /// needs an XPath engine, which this does not have — so instead each text
-    /// node and attribute becomes an argument named by its element path,
-    /// prefixed `xml.`:
-    ///
-    /// ```text
-    /// <order><item id="7">widget</item></order>
-    ///   -> xml.order.item      = widget
-    ///      xml.order.item.@id  = 7
-    /// ```
-    ///
-    /// That is not ModSecurity-compatible naming, and rules written against
-    /// `XML:/order/item` will not match it. It is chosen because the
-    /// alternative was leaving XML bodies uninspected entirely: with this,
-    /// `SecRule ARGS "@detectSQLi"` covers XML payloads the same way it covers
-    /// form and JSON ones, which is what the common rulesets actually do.
-    ///
-    /// The whole document's text is also available as `REQUEST_BODY`.
+    /// Parse XML values into their own collection, without inventing HTTP
+    /// arguments. `XML:/*` selects text and `XML://@*` attribute values.
     pub fn parse_xml_body(&mut self) -> Result<(), String> {
-        use quick_xml::events::Event;
-
         self.body_processor = "XML".to_string();
-
-        if self.body.iter().all(|b| b.is_ascii_whitespace()) {
-            return Ok(());
-        }
-
-        let mut reader = quick_xml::Reader::from_reader(self.body.as_slice());
-        reader.config_mut().check_end_names = true;
-
-        let mut path: Vec<String> = Vec::new();
-        // Text arrives in fragments, split around entity references. Buffering
-        // per element and flushing on the closing tag keeps a value whole: a
-        // payload written as `UNION&#32;SELECT` would otherwise be split into
-        // pieces small enough for every rule to miss.
-        let mut text: Vec<String> = Vec::new();
-        let mut count = 0usize;
-        let mut unresolved_entity: Option<String> = None;
-        let mut buf = Vec::new();
-
-        macro_rules! cap {
-            ($name:expr, $value:expr) => {
-                if push_xml_arg(&$name, $value, &mut self.args_post, &mut count) {
-                    let msg = xml_limit_message();
-                    self.body_error = Some(msg.clone());
-                    return Err(msg);
-                }
-            };
-        }
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                    if path.len() >= MAX_XML_DEPTH {
-                        let msg = format!(
-                            "XML body exceeded {MAX_XML_DEPTH} levels of nesting; \
-                             only part of the body was inspected"
-                        );
-                        self.body_error = Some(msg.clone());
-                        return Err(msg);
-                    }
-                    path.push(decode_name(e.name().as_ref()));
-                    text.push(String::new());
-
-                    for attr in e.attributes().flatten() {
-                        let attr_name = decode_name(attr.key.as_ref());
-                        // A namespace declaration (`xmlns`, `xmlns:p`) is
-                        // document structure, not data (Namespaces in XML
-                        // 1.0, section 3). Flattening it put `xmlns` into
-                        // ARGS_NAMES, which CRS 941130 reads as an XSS
-                        // attribute vector, blocking any namespaced document.
-                        // The declaration stays visible in REQUEST_BODY.
-                        if is_namespace_declaration(&attr_name) {
-                            continue;
-                        }
-                        let value = attr
-                            .decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )
-                            .map(|v| v.into_owned())
-                            .unwrap_or_default();
-                        let name = format!("xml.{}.@{}", path.join("."), attr_name);
-                        cap!(name, value);
-                    }
-                }
-                Ok(Event::End(_)) => {
-                    if let Some(collected) = text.pop() {
-                        let trimmed = collected.trim();
-                        if !trimmed.is_empty() && !path.is_empty() {
-                            let name = format!("xml.{}", path.join("."));
-                            cap!(name, trimmed.to_string());
-                        }
-                    }
-                    path.pop();
-                }
-                Ok(Event::Text(e)) => {
-                    if let (Some(current), Ok(t)) = (text.last_mut(), e.decode()) {
-                        current.push_str(t.as_ref());
-                    }
-                }
-                Ok(Event::CData(e)) => {
-                    // CDATA is text that is deliberately not markup, and a
-                    // classic place to hide a payload.
-                    if let Some(current) = text.last_mut() {
-                        current.push_str(&String::from_utf8_lossy(e.as_ref()));
-                    }
-                }
-                Ok(Event::GeneralRef(e)) => {
-                    let name = e.decode().map(|n| n.into_owned()).unwrap_or_default();
-                    match resolve_entity(&name) {
-                        Some(resolved) => {
-                            if let Some(current) = text.last_mut() {
-                                current.push_str(&resolved);
-                            }
-                        }
-                        None => {
-                            // A custom entity. Expanding it is how XXE and
-                            // billion-laughs work, so this deliberately does
-                            // not. But the origin application may expand it,
-                            // and content this engine cannot see is content it
-                            // cannot inspect -- so say so rather than treat
-                            // the document as fully examined.
-                            unresolved_entity.get_or_insert(name);
-                        }
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    let msg = format!("XML parsing error: {e}");
-                    self.body_error = Some(msg.clone());
-                    return Err(msg);
-                }
+        self.xml.clear();
+        self.body_error = None;
+        let result = super::xml::parse(&self.body);
+        let error = match result {
+            Ok((values, suppressed_entity)) => {
+                self.xml = values;
+                suppressed_entity.map(|name| {
+                    format!(
+                        "XML body references the undeclared or custom entity '&{name};', which \
+                     is not expanded; any content it carries was not inspected"
+                    )
+                })
             }
-            buf.clear();
+            Err(error) => Some(error),
+        };
+        if let Some(error) = error {
+            self.body_error = Some(error.clone());
+            return Err(error);
         }
-
-        // Elements left open at end of input mean the document was cut short.
-        // quick-xml reports EOF rather than an error for this, so a truncated
-        // body would otherwise look like a complete one that simply had less
-        // in it.
-        if !path.is_empty() {
-            let msg = format!(
-                "XML body ended with {} element(s) still open; the document is truncated \
-                 and was only partly inspected",
-                path.len()
-            );
-            self.body_error = Some(msg.clone());
-            return Err(msg);
-        }
-
-        if let Some(name) = unresolved_entity {
-            let msg = format!(
-                "XML body references the undeclared or custom entity '&{name};', which is \
-                 not expanded (expanding it is how XXE and entity-expansion attacks work). \
-                 Any content it carries was not inspected."
-            );
-            self.body_error = Some(msg.clone());
-            return Err(msg);
-        }
-
         Ok(())
     }
 
@@ -476,214 +535,315 @@ impl RequestData {
     pub fn all_args(&self) -> Vec<(&str, &str)> {
         let mut all = self.args_get.all();
         all.extend(self.args_post.all());
+        if let Some(path) = self.path_arguments() {
+            all.extend(path.all());
+        }
         all
     }
 }
 
-/// Most arguments extracted from a single XML body.
-const MAX_XML_ARGS: usize = 4096;
-
-/// Deepest element nesting the XML processor will descend.
-///
-/// quick-xml is a pull parser and does not recurse, so this bounds work and
-/// argument-name length rather than stack depth.
-const MAX_XML_DEPTH: usize = 64;
-
-fn xml_limit_message() -> String {
-    format!(
-        "XML body exceeded {MAX_XML_ARGS} extracted values; only part of the \
-         body was inspected"
-    )
-}
-
-/// Resolve an entity reference this engine is willing to expand.
-///
-/// The five predefined XML entities and numeric character references only.
-/// Custom entities declared in an internal DTD subset are deliberately not
-/// resolved: expanding those is precisely the mechanism behind XXE and
-/// billion-laughs, and no amount of care makes expanding attacker-supplied
-/// entity definitions safe.
-fn resolve_entity(name: &str) -> Option<String> {
-    if let Some(predefined) = quick_xml::escape::resolve_predefined_entity(name) {
-        return Some(predefined.to_string());
+fn component_strings(bytes: &[u8]) -> (String, Option<ByteValue>) {
+    match std::str::from_utf8(bytes) {
+        Ok(value) => (value.to_owned(), None),
+        Err(_) => {
+            let value = ByteValue::from(bytes);
+            (value.to_string(), Some(value))
+        }
     }
-    // Numeric character references: &#65; and &#x41;.
-    let digits = name.strip_prefix('#')?;
-    let code = match digits.strip_prefix(['x', 'X']) {
-        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-        None => digits.parse::<u32>().ok()?,
-    };
-    char::from_u32(code).map(|c| c.to_string())
 }
 
-/// Element and attribute names are ASCII in practice; lossy decoding avoids
-/// rejecting a document over a malformed name when the payload is elsewhere.
-fn decode_name(raw: &[u8]) -> String {
-    String::from_utf8_lossy(raw).to_string()
-}
-
-/// Whether an attribute's qualified name declares a namespace: `xmlns` itself
-/// or an `xmlns:<prefix>`.
-fn is_namespace_declaration(name: &str) -> bool {
-    name == "xmlns" || name.starts_with("xmlns:")
-}
-
-/// Decode one component of `application/x-www-form-urlencoded` input.
-///
-/// In that encoding `+` denotes a space -- it is what a browser emits for a
-/// space in a submitted form -- so decoding only percent-escapes leaves the
-/// argument holding a literal `+` where the origin application will see a
-/// space. Any rule matching a payload that contains whitespace then misses,
-/// which is a bypass rather than a coverage gap: the same request reaches the
-/// application as spaces either way.
-///
-/// The `+` substitution happens *before* percent-decoding, so a plus that was
-/// genuinely sent as `%2B` survives as a plus instead of becoming a space.
-fn form_decode(component: &str) -> String {
-    let plus_decoded: Cow<'_, str> = if component.as_bytes().contains(&b'+') {
-        Cow::Owned(component.replace('+', " "))
+// Coraza first removes the fragment, then net/url preserves an already-valid
+// RawPath. If any path byte requires escaping, Go re-escapes the *decoded*
+// path as a unit. RawQuery is carried through without re-encoding.
+fn coraza_request_uri(raw: &[u8], raw_path: &[u8], decoded: &[u8]) -> Option<ByteValue> {
+    let target = &raw[..memchr::memchr(b'#', raw).unwrap_or(raw.len())];
+    let fallback = || (target.len() != raw.len()).then(|| ByteValue::from(target));
+    let (prefix, path) = if raw_path.starts_with(b"/") {
+        (&[][..], raw_path)
     } else {
-        Cow::Borrowed(component)
+        let Some(scheme_end) = scheme_end(raw_path) else {
+            return fallback();
+        };
+        let after_scheme = &raw_path[scheme_end + 1..];
+        let prefix_len = if let Some(authority) = after_scheme.strip_prefix(b"//") {
+            scheme_end + 3 + memchr::memchr(b'/', authority).unwrap_or(authority.len())
+        } else if after_scheme.starts_with(b"/") {
+            scheme_end + 1
+        } else {
+            // A rootless absolute request target is opaque to net/url.
+            raw_path.len()
+        };
+        raw_path.split_at(prefix_len)
     };
-    percent_encoding::percent_decode_str(&plus_decoded)
-        .decode_utf8_lossy()
-        .into_owned()
+    let escape = path
+        .iter()
+        .any(|b| !(path_byte(*b) || b"!%'()*[]".contains(b)));
+    let lower_scheme = prefix
+        .split(|&b| b == b':')
+        .next()
+        .is_some_and(|p| p.iter().any(u8::is_ascii_uppercase));
+    if !escape && !lower_scheme {
+        return fallback();
+    }
+    if target.iter().any(u8::is_ascii_control)
+        || memchr::memchr_iter(b'%', path).any(|i| {
+            !path
+                .get(i + 1..i + 3)
+                .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+        })
+    {
+        return fallback();
+    }
+    let mut out = Vec::with_capacity(target.len());
+    out.extend_from_slice(prefix);
+    if lower_scheme {
+        let end = memchr::memchr(b':', prefix).expect("absolute URI prefix");
+        out[..end].make_ascii_lowercase();
+    }
+    if escape {
+        const HEX: &[u8] = b"0123456789ABCDEF";
+        for &b in decoded {
+            if path_byte(b) {
+                out.push(b);
+            } else {
+                out.extend_from_slice(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]);
+            }
+        }
+    } else {
+        out.extend_from_slice(path);
+    }
+    out.extend_from_slice(&target[raw_path.len()..]);
+    Some(ByteValue::from(out))
 }
 
-/// Record one extracted XML value. Returns `true` once the cap is hit.
-fn push_xml_arg(
-    name: &str,
-    value: String,
-    args: &mut HashMapCollection,
-    count: &mut usize,
-) -> bool {
-    if *count >= MAX_XML_ARGS {
-        return true;
+fn scheme_end(input: &[u8]) -> Option<usize> {
+    if !input.first().is_some_and(u8::is_ascii_alphabetic) {
+        return None;
     }
-    *count += 1;
-    args.add(name.to_string(), value);
-    false
+    let colon = memchr::memchr(b':', input)?;
+    (input[..colon]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(b)))
+    .then_some(colon)
 }
 
-/// Most arguments extracted from a single JSON body.
-///
-/// A hostile body can be small on the wire and still expand into an enormous
-/// number of arguments — `[[[...]]]` or a long array of scalars — each of
-/// which would then be run through every rule's operator. The cap bounds that
-/// work; exceeding it is reported as a body-processor error rather than
-/// silently truncating, since a partially inspected body is not a safe body.
-const MAX_JSON_ARGS: usize = 4096;
+fn path_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-_.~$&+,/:;=@".contains(&b)
+}
 
-/// Deepest JSON nesting the flattener will descend.
-///
-/// `serde_json` already refuses to *parse* beyond its own recursion limit;
-/// this bounds the separate recursion done here.
-const MAX_JSON_DEPTH: usize = 64;
+/// Decode the path after query and fragment splitting. Plus is literal here.
+fn decoded_request_path_bytes(input: &[u8], coraza: bool) -> Vec<u8> {
+    let path = match scheme_end(input).map(|colon| &input[colon + 1..]) {
+        Some(rest) if rest.starts_with(b"//") => {
+            let authority = &rest[2..];
+            &authority[memchr::memchr(b'/', authority).unwrap_or(authority.len())..]
+        }
+        Some(rest) if coraza && rest.starts_with(b"/") => rest,
+        Some(_) if coraza => &[],
+        _ => input,
+    };
 
-/// Flatten a JSON value into `args`, naming each scalar by its path.
-///
-/// `path` is the prefix built so far and is restored before returning, so one
-/// buffer is reused for the whole document. Returns `true` if a limit was hit
-/// and the result is therefore incomplete.
-fn flatten_json(
-    value: &JsonNode,
-    path: &mut String,
-    args: &mut HashMapCollection,
-    count: &mut usize,
-    depth: usize,
-) -> bool {
-    if depth > MAX_JSON_DEPTH {
-        return true;
+    let mut escapes = memchr::memchr_iter(b'%', path);
+    let Some(first) = escapes.next() else {
+        return path.to_vec();
+    };
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut start = 0;
+    for pos in std::iter::once(first).chain(escapes) {
+        let Some(hex) = path.get(pos + 1..pos + 3).and_then(|pair| {
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        }) else {
+            // A malformed escape preserves the complete original target path,
+            // including the authority of an absolute URI.
+            return input.to_vec();
+        };
+        decoded.extend_from_slice(&path[start..pos]);
+        decoded.push(hex);
+        start = pos + 3;
     }
+    decoded.extend_from_slice(&path[start..]);
+    decoded
+}
 
-    match value {
-        JsonNode::Object(entries) => {
-            // Duplicate keys produce repeated entries under the same argument
-            // name, so every value a client sent is inspected. Keeping only
-            // one would let a parser differential hide a payload.
-            for (key, child) in entries {
-                let restore = path.len();
-                path.push('.');
-                path.push_str(key);
-                let truncated = flatten_json(child, path, args, count, depth + 1);
-                path.truncate(restore);
-                if truncated {
+// Go strings.TrimSpace recognizes Unicode whitespace even when later header
+// bytes are opaque. Decode only the leading code point, never replace bytes.
+fn trim_header_leading_space(mut value: &[u8]) -> &[u8] {
+    while let Some(&first) = value.first() {
+        let width = match first {
+            0..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => break,
+        };
+        let Some(character) = value
+            .get(..width)
+            .and_then(|prefix| std::str::from_utf8(prefix).ok())
+            .and_then(|text| text.chars().next())
+        else {
+            break;
+        };
+        if !character.is_whitespace() {
+            break;
+        }
+        value = &value[width..];
+    }
+    value
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn parse_form_bytes(
+    mut input: &[u8],
+    collection: &mut HashMapCollection,
+    mut remaining: usize,
+) -> bool {
+    // Keep an escaped or opaque field from forcing unrelated plain fields
+    // through the byte decoder. Always cut at an actual form separator.
+    const BLOCK_BYTES: usize = 1024;
+    while let Some(tail) = input.get(BLOCK_BYTES..) {
+        let Some(separator) = memchr::memchr(b'&', tail) else {
+            break;
+        };
+        let end = BLOCK_BYTES + separator;
+        if parse_form_block(&input[..end], collection, &mut remaining) {
+            return true;
+        }
+        input = &input[end + 1..];
+    }
+    parse_form_block(input, collection, &mut remaining)
+}
+
+fn parse_form_block(
+    input: &[u8],
+    collection: &mut HashMapCollection,
+    remaining: &mut usize,
+) -> bool {
+    // Unescaped text needs no per-field decoder or UTF-8 validation.
+    if memchr::memchr2(b'%', b'+', input).is_none() {
+        if let Ok(text) = std::str::from_utf8(input) {
+            for pair in text.split('&').filter(|pair| !pair.is_empty()) {
+                if *remaining == 0 {
                     return true;
                 }
+                *remaining -= 1;
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                collection.add_bytes(key, value);
             }
-            false
+            return false;
         }
-        JsonNode::Array(items) => {
-            for (index, child) in items.iter().enumerate() {
-                let restore = path.len();
-                path.push('.');
-                path.push_str(&index.to_string());
-                let truncated = flatten_json(child, path, args, count, depth + 1);
-                path.truncate(restore);
-                if truncated {
-                    return true;
-                }
-            }
-            false
+    }
+    for pair in input.split(|&b| b == b'&').filter(|pair| !pair.is_empty()) {
+        if *remaining == 0 {
+            return true;
         }
-        // Scalars are the leaves that become arguments. `null` contributes an
-        // empty value rather than being skipped, so a rule testing for the
-        // presence of a key still sees it.
-        JsonNode::String(s) => push_json_arg(path, s.clone(), args, count),
-        JsonNode::Number(n) => push_json_arg(path, n.clone(), args, count),
-        JsonNode::Bool(b) => push_json_arg(path, b.to_string(), args, count),
-        JsonNode::Null => push_json_arg(path, String::new(), args, count),
+        *remaining -= 1;
+        let equal = pair.iter().position(|&b| b == b'=');
+        let (key, value) = equal.map_or((pair, &b""[..]), |i| (&pair[..i], &pair[i + 1..]));
+        collection.add_bytes(
+            crate::transformations::bytes::url_decode_stage(key, false),
+            crate::transformations::bytes::url_decode_stage(value, false),
+        );
     }
-}
-
-/// Record one flattened scalar. Returns `true` once the argument cap is hit.
-fn push_json_arg(
-    path: &str,
-    value: String,
-    args: &mut HashMapCollection,
-    count: &mut usize,
-) -> bool {
-    if *count >= MAX_JSON_ARGS {
-        return true;
-    }
-    *count += 1;
-    args.add(path.to_string(), value);
     false
-}
-
-/// Extract the `boundary` parameter from a multipart Content-Type value.
-fn extract_multipart_boundary(content_type: &str) -> Option<String> {
-    for param in content_type.split(';').skip(1) {
-        let param = param.trim();
-        if let Some((key, value)) = param.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("boundary") {
-                let value = value.trim().trim_matches('"');
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract a parameter value (e.g. `name`, `filename`) from a
-/// Content-Disposition header value.
-fn extract_disposition_param(header_value: &str, param: &str) -> Option<String> {
-    for part in header_value.split(';') {
-        let part = part.trim();
-        if let Some((key, value)) = part.split_once('=') {
-            if key.trim().eq_ignore_ascii_case(param) {
-                return Some(value.trim().trim_matches('"').to_string());
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn form_parsing_preserves_observed_names_binary_data_and_field_boundaries() {
+        use crate::variables::ByteCollection;
+
+        fn check(input: &[u8], expected: &[(&[u8], &[u8], &[u8])]) {
+            let mut request = RequestData::new();
+            let mut uri = b"/form?".to_vec();
+            uri.extend_from_slice(input);
+            request.set_uri_bytes(&uri);
+            request.body.extend_from_slice(input);
+            request.parse_form_body();
+            assert_eq!(request.args_get.all_bytes_with_names(), expected);
+            assert_eq!(request.args_post.all_bytes_with_names(), expected);
+        }
+
+        // The first '=' separates a field. Empty segments vanish, while an
+        // empty name and a bare name remain separate observed members.
+        let plain: &[(&[u8], &[u8], &[u8])] = &[
+            (b"k", b"K", b"one"),
+            (b"k", b"k", b"two=2"),
+            (b"", b"", b"empty"),
+            (b"bare", b"bare", b""),
+        ];
+        check(b"&&K=one&=empty&k=two=2&bare&&", plain);
+        check(b"%4B=one&=empty&k=two%3D2&bare&", plain);
+        check(b"K=one&=empty&k=two=2&b%61re", plain);
+        check(
+            "Ö=é&ö=茶".as_bytes(),
+            &[
+                ("ö".as_bytes(), "Ö".as_bytes(), "é".as_bytes()),
+                ("ö".as_bytes(), "ö".as_bytes(), "茶".as_bytes()),
+            ],
+        );
+        check(
+            b"k=%ff&x=a%26b&bad=%G1%&plus=a+b&plus=a%2Bb",
+            &[
+                (b"k", b"k", b"\xff"),
+                (b"x", b"x", b"a&b"),
+                (b"bad", b"bad", b"%G1%"),
+                (b"plus", b"plus", b"a b"),
+                (b"plus", b"plus", b"a+b"),
+            ],
+        );
+        check(
+            b"x=\xff&\xfe=%2b",
+            &[(b"x", b"x", b"\xff"), (b"\xfe", b"\xfe", b"+")],
+        );
+    }
+
+    #[test]
+    fn form_decoding_preserves_fields_across_block_boundaries() {
+        use crate::variables::ByteCollection;
+
+        for separator in [1023, 1024, 1025, 8192] {
+            for opaque in [false, true] {
+                let byte = if opaque { 0xff } else { b'a' };
+                let first = vec![byte; separator - 2];
+                let second = vec![if opaque { b'z' } else { 0xfe }; 2048];
+                let mut form = b"A=".to_vec();
+                form.extend_from_slice(&first);
+                form.extend_from_slice(b"&&B=");
+                form.extend_from_slice(&second);
+                form.extend_from_slice(b"&a=%26%3D&b=two+words&bare");
+
+                let mut req = RequestData::new();
+                parse_form_bytes(&form, &mut req.args_post, usize::MAX);
+                let expected: &[(&[u8], &[u8], &[u8])] = &[
+                    (b"a", b"A", &first),
+                    (b"a", b"a", b"&="),
+                    (b"b", b"B", &second),
+                    (b"b", b"b", b"two words"),
+                    (b"bare", b"bare", b""),
+                ];
+                assert_eq!(req.args_post.all_bytes_with_names(), expected);
+
+                // The threshold may also lie within a sole field.
+                let mut req = RequestData::new();
+                parse_form_bytes(&form[..separator], &mut req.args_get, usize::MAX);
+                assert_eq!(req.args_get.all_bytes_with_names(), &expected[..1]);
+            }
+        }
+    }
 
     #[test]
     fn test_parse_cookie_header() {
@@ -714,7 +874,8 @@ mod tests {
         assert_eq!(req.args_post.get("field1"), Some(vec!["value1"]));
         // File part does NOT land in ARGS_POST but in FILES.
         assert_eq!(req.args_post.get("upload"), None);
-        assert_eq!(req.files.get("upload"), Some(vec!["a.txt"]));
+        assert_eq!(req.files.get(""), Some(vec!["a.txt"]));
+        assert_eq!(req.files_names.get(""), Some(vec!["upload"]));
 
         // Every part header line is recorded under the part name.
         let field1_headers = req.multipart_part_headers.get("field1").unwrap();
@@ -741,6 +902,8 @@ mod tests {
         let mut req = RequestData::new();
         req.append_body(b"irrelevant");
         assert!(!req.parse_multipart_body("multipart/form-data"));
-        assert!(req.body_processor.is_empty());
+        assert_eq!(req.body_processor, "MULTIPART");
+        assert!(req.body_error.is_some());
+        assert!(req.multipart_strict_error);
     }
 }

@@ -1,0 +1,333 @@
+//! Allocation regressions for rule evaluation and byte transformation pipelines.
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use zentinel_modsec::ModSecurity;
+
+thread_local! {
+    static TRACKING: Cell<bool> = const { Cell::new(false) };
+    static REQUESTED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+struct CountingAllocator;
+
+fn count_allocation(size: usize) {
+    let _ = TRACKING.try_with(|enabled| {
+        if enabled.get() {
+            let _ = REQUESTED_BYTES.try_with(|bytes| bytes.set(bytes.get() + size));
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        }
+    });
+}
+
+// SAFETY: every operation delegates unchanged to the system allocator; the
+// thread-local counters neither allocate nor inspect allocated memory.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        count_allocation(size);
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+fn rules(skipped: usize) -> ModSecurity {
+    let mut config = String::from(
+        "SecRuleEngine DetectionOnly\n\
+         SecRule REQUEST_METHOD \"@streq GET\" \"id:1,phase:2,pass,skipAfter:END\"\n",
+    );
+    for i in 0..skipped {
+        config.push_str(&format!(
+            "SecRule ARGS \"@contains secret\" \"id:{},phase:2,pass,t:lowercase,msg:'inactive rule metadata',tag:'paranoia-level/4'\"\n",
+            i + 100
+        ));
+    }
+    config.push_str(
+        "SecMarker END\n\
+         SecRule REQUEST_METHOD \"@streq GET\" \"id:999999,phase:2,pass\"\n",
+    );
+    ModSecurity::from_string(&config).unwrap()
+}
+
+fn request_allocations(engine: &ModSecurity) -> (usize, Vec<String>) {
+    ALLOCATIONS.set(0);
+    TRACKING.set(true);
+    let mut tx = engine.new_transaction();
+    tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+    tx.process_request_headers().unwrap();
+    tx.process_request_body().unwrap();
+    TRACKING.set(false);
+    let allocations = ALLOCATIONS.get();
+    (allocations, tx.matched_rules().to_vec())
+}
+
+#[test]
+fn inactive_rule_blocks_have_bounded_request_allocation_cost() {
+    let small = rules(1);
+    let large = rules(200);
+    // Keep loader/lazy initialization outside the measured request windows.
+    request_allocations(&small);
+    request_allocations(&large);
+    let (small_count, small_matches) = request_allocations(&small);
+    let (large_count, large_matches) = request_allocations(&large);
+    assert_eq!(small_matches, ["1", "999999"]);
+    assert_eq!(large_matches, small_matches);
+    // The slack permits small fixed bookkeeping changes, while catching the
+    // thousands of allocations caused by copying a skipped rule block.
+    assert!(
+        large_count <= small_count + 64,
+        "skipped metadata caused per-request allocation growth: {small_count} -> {large_count}"
+    );
+}
+
+#[test]
+fn unchanged_decode_stages_borrow_without_allocating() {
+    use zentinel_modsec::transformations::{create_transformation, TransformationPipeline};
+
+    let mut pipeline = TransformationPipeline::new();
+    for name in ["urlDecodeUni", "htmlEntityDecode", "jsDecode", "cssDecode"] {
+        pipeline.add(create_transformation(name).unwrap());
+    }
+
+    let input = [b'a'; 4096];
+    ALLOCATIONS.set(0);
+    TRACKING.set(true);
+    let result = pipeline.apply_bytes(&input).unwrap();
+    TRACKING.set(false);
+    assert_eq!(result.as_ptr(), input.as_ptr());
+    assert_eq!(ALLOCATIONS.get(), 0);
+}
+
+#[test]
+fn literal_misses_and_counts_do_not_allocate_by_header_size_or_cardinality() {
+    for target in ["REQUEST_HEADERS:absent", "&REQUEST_HEADERS"] {
+        let engine = ModSecurity::from_string(&format!(
+            r#"SecRule {target} "@streq unrelated" "id:10,phase:1,pass""#
+        ))
+        .unwrap();
+        let measure = |count, value_size| {
+            let mut tx = engine.new_transaction();
+            tx.process_uri("/catalog", "GET", "HTTP/1.1").unwrap();
+            let value = "a".repeat(value_size);
+            for i in 0..count {
+                tx.add_request_header(&format!("X-Header-{i}"), &value)
+                    .unwrap();
+            }
+            REQUESTED_BYTES.set(0);
+            TRACKING.set(true);
+            tx.process_request_headers().unwrap();
+            TRACKING.set(false);
+            assert!(tx.matched_rules().is_empty());
+            REQUESTED_BYTES.get()
+        };
+        measure(1, 16);
+        let one = measure(1, 16);
+        let many = measure(64, 4096);
+        assert!(many <= one + 64, "{target}: {one} -> {many} bytes");
+    }
+}
+
+#[test]
+fn static_misses_borrow_headers_arguments_and_body_bytes() {
+    let engine = ModSecurity::from_string(
+        r#"SecRuleEngine On
+SecRequestBodyAccess On
+SecResponseBodyAccess On
+SecResponseBodyLimit 2097152
+SecResponseBodyMimeType application/octet-stream
+SecAction "id:11,phase:1,pass,ctl:requestBodyProcessor=RAW"
+SecRule ARGS_GET|REQUEST_HEADERS "@streq unrelated" "id:12,phase:1,pass"
+SecRule REQUEST_BODY "@streq unrelated" "id:13,phase:2,pass"
+SecRule RESPONSE_BODY "@streq unrelated" "id:14,phase:4,pass,multiMatch,t:none"
+"#,
+    )
+    .unwrap();
+    let measure = |len, opaque| {
+        let mut data = vec![b'x'; len];
+        if opaque {
+            data[len - 1] = 0xff;
+        }
+        let mut tx = engine.new_transaction();
+        let mut uri = b"/?page=".to_vec();
+        uri.extend_from_slice(&data);
+        tx.process_uri_bytes(&uri, b"POST", b"HTTP/1.1").unwrap();
+        tx.add_request_header_bytes(b"X-Catalog", &data).unwrap();
+        let measure_call = |f: &mut dyn FnMut()| {
+            REQUESTED_BYTES.set(0);
+            TRACKING.set(true);
+            f();
+            TRACKING.set(false);
+            REQUESTED_BYTES.get()
+        };
+        let phase_one = measure_call(&mut || tx.process_request_headers().unwrap());
+        tx.append_request_body(&data).unwrap();
+        let phase_two = measure_call(&mut || tx.process_request_body().unwrap());
+        tx.add_response_header("Content-Type", "application/octet-stream")
+            .unwrap();
+        tx.process_response_headers_with_status(200, "HTTP/1.1")
+            .unwrap();
+        tx.append_response_body(&data).unwrap();
+        let phase_four = measure_call(&mut || tx.process_response_body().unwrap());
+        assert_eq!(tx.matched_rules(), ["11"]);
+        [phase_one, phase_two, phase_four]
+    };
+    for opaque in [false, true] {
+        let small = measure(4096, opaque);
+        let large = measure(1 << 20, opaque);
+        for (small, large) in small.into_iter().zip(large) {
+            assert!(
+                large <= small + 64,
+                "opaque={opaque}: {small} -> {large} requested bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn matching_pass_rules_do_not_copy_unused_audit_metadata() {
+    let base = "SecAction \"id:1,phase:2,pass,setvar:tx.label=normal";
+    let small = ModSecurity::from_string(&format!("{base}\"")).unwrap();
+    let tags = (0..20)
+        .map(|i| format!(",tag:'category-{i}'"))
+        .collect::<String>();
+    let large = ModSecurity::from_string(&format!(
+        "{base}{tags},msg:'audit message',logdata:'extra info',ver:'1.2'\""
+    ))
+    .unwrap();
+    request_allocations(&small);
+    request_allocations(&large);
+    let (baseline, matches) = request_allocations(&small);
+    let (with_metadata, extra_matches) = request_allocations(&large);
+    assert_eq!(matches, ["1"]);
+    assert_eq!(extra_matches, matches);
+    assert_eq!(with_metadata, baseline);
+}
+
+#[test]
+fn capture_publication_moves_the_subgroup_buffer_into_tx() {
+    use zentinel_modsec::variables::ByteCollection;
+
+    let data = vec![b'a'; 64 * 1024];
+    let measure = |pattern: &str, groups: usize| {
+        let rules = format!(
+            r#"SecRule REQUEST_HEADERS:X-Data "@rx {pattern}" "id:1,phase:1,pass,capture""#
+        );
+        let engine = ModSecurity::from_string(&rules).unwrap();
+        let run = || {
+            let mut tx = engine.new_transaction();
+            tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+            tx.add_request_header_bytes(b"X-Data", &data).unwrap();
+            REQUESTED_BYTES.set(0);
+            TRACKING.set(true);
+            tx.process_request_headers().unwrap();
+            TRACKING.set(false);
+            assert_eq!(tx.tx().get_bytes(b"0").unwrap(), [data.as_slice()]);
+            assert_eq!(tx.tx().get_bytes(b"1").is_some(), groups == 1);
+            REQUESTED_BYTES.get()
+        };
+        run();
+        run()
+    };
+    let whole = measure("^a+$", 0);
+    let group = measure("^(a+)$", 1);
+    // One additional result buffer, plus fixed regex/collection metadata.
+    assert!(group <= whole + data.len() + 2048, "{whole} -> {group}");
+}
+
+#[test]
+fn a_macro_first_value_lookup_does_not_copy_the_duplicate_bucket() {
+    let engine = ModSecurity::from_string(
+        r#"SecRule REQUEST_METHOD "@streq %{ArGs.label}" "id:1,phase:1,pass""#,
+    )
+    .unwrap();
+    let measure = |duplicates| {
+        let mut tx = engine.new_transaction();
+        let uri = format!("/?label=GET{}", "&label=more".repeat(duplicates));
+        tx.process_uri(&uri, "GET", "HTTP/1.1").unwrap();
+        REQUESTED_BYTES.set(0);
+        TRACKING.set(true);
+        tx.process_request_headers().unwrap();
+        TRACKING.set(false);
+        assert_eq!(tx.matched_rules(), ["1"]);
+        REQUESTED_BYTES.get()
+    };
+    measure(0);
+    let one = measure(0);
+    let many = measure(256);
+    assert!(
+        many <= one + 128,
+        "macro allocated by duplicate count: {one} -> {many}"
+    );
+}
+
+#[test]
+fn verdict_only_detectors_skip_owned_fingerprints() {
+    use zentinel_modsec::libinjection::{
+        detect_sqli, detect_xss, is_sqli, is_xss, DetectionResult,
+    };
+
+    // Warm both entry points before measuring their positive verdicts.
+    type Detector = (fn(&str) -> bool, fn(&str) -> DetectionResult, &'static str);
+    let detectors: [Detector; 2] = [
+        (is_sqli, detect_sqli, r#"-1839" or "1"="2"#),
+        (is_xss, detect_xss, "<script>"),
+    ];
+    for (verdict, detailed, input) in detectors {
+        assert!(verdict(input));
+        assert!(detailed(input).fingerprint.is_some());
+        ALLOCATIONS.set(0);
+        TRACKING.set(true);
+        let matched = verdict(input);
+        TRACKING.set(false);
+        let verdict_allocations = ALLOCATIONS.get();
+        ALLOCATIONS.set(0);
+        TRACKING.set(true);
+        let result = detailed(input);
+        TRACKING.set(false);
+        assert!(matched && result.is_injection);
+        assert!(ALLOCATIONS.get() > verdict_allocations);
+    }
+}
+
+#[test]
+fn static_count_misses_do_not_copy_the_selector_name() {
+    let measure = |key: &str| {
+        let engine = ModSecurity::from_string(&format!(
+            r#"SecRule &REQUEST_HEADERS:{key} "@streq 2" "id:123,phase:1,pass,capture,multiMatch,t:none,t:lowercase""#
+        )).unwrap();
+        let run = || {
+            let mut tx = engine.new_transaction();
+            tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+            tx.add_request_header(key, "first").unwrap();
+            REQUESTED_BYTES.set(0);
+            TRACKING.set(true);
+            tx.process_request_headers().unwrap();
+            TRACKING.set(false);
+            assert!(tx.matched_rules().is_empty());
+            REQUESTED_BYTES.get()
+        };
+        run();
+        run()
+    };
+    let short = measure("x-report");
+    let long = measure(&"x".repeat(4096));
+    assert!(
+        long <= short + 64,
+        "count target name was copied on a miss: {short} -> {long}"
+    );
+}

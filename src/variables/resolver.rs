@@ -1,48 +1,33 @@
 //! Variable resolution engine.
 
-use super::{RequestData, ResponseData, TxCollection};
-use crate::parser::{Selection, VariableName, VariableSpec, XmlTarget};
-use once_cell::sync::Lazy;
-use regex::Regex;
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::OnceLock;
 
-/// Compile a regex written in rule text (an `ARGS:/.../` selection or a
-/// `!ARGS:/.../` exclusion), once per pattern.
-///
-/// These used to be compiled on every evaluation, once per resolved key for an
-/// exclusion. Compiling costs orders of magnitude more than matching: CRS
-/// 942431's two `!ARGS_NAMES:/.../` exclusions took ~5.5ms per request on
-/// clean traffic, for patterns that never change.
-///
-/// Patterns come only from loaded rules, so the cache is bounded by the rule
-/// set. A pattern that does not compile is cached as `None` and never matches,
-/// as before. `Regex` clones share the compiled program.
-fn cached_regex(pattern: &str) -> Option<Regex> {
-    static CACHE: Lazy<RwLock<HashMap<String, Option<Regex>>>> = Lazy::new(Default::default);
-    if let Some(hit) = CACHE.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
-        return hit.clone();
-    }
-    let compiled = Regex::new(pattern).ok();
-    CACHE
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(pattern.to_string())
-        .or_insert(compiled)
-        .clone()
+use super::{ByteValue, RequestData, ResponseData, TxCollection};
+#[path = "resolver_bytes.rs"]
+mod byte_resolution;
+use crate::parser::{Selection, VariableName, VariableSpec, XmlTarget};
+/// Connector fields distinguish an omitted callback from empty or zero inputs.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConnectorMetadata {
+    pub request_line: bool,
+    pub client_port: bool,
+    pub server_port: bool,
+    pub response_status: bool,
+    pub source_qualified_arguments: bool,
 }
 
 /// Variable resolver for transaction context.
+#[derive(Clone, Copy)]
 pub struct VariableResolver<'a> {
     request: &'a RequestData,
     response: &'a ResponseData,
     tx: &'a TxCollection,
     matched_var: Option<&'a str>,
     matched_vars: &'a [(String, String)],
-    /// Carried alongside the other resolver inputs for symmetry; no variable
-    /// reads it yet (`TX:0`..`TX:9` are served from the TX collection).
-    #[allow(dead_code)]
-    captures: &'a [String],
+    logical_matches: Option<&'a [(ByteValue, ByteValue)]>,
+    matched_bytes: Option<&'a [(ByteValue, ByteValue)]>,
+    request_line: Option<&'a OnceLock<Box<[u8]>>>,
+    connector_metadata: ConnectorMetadata,
 }
 
 impl<'a> VariableResolver<'a> {
@@ -53,7 +38,7 @@ impl<'a> VariableResolver<'a> {
         tx: &'a TxCollection,
         matched_var: Option<&'a str>,
         matched_vars: &'a [(String, String)],
-        captures: &'a [String],
+        _captures: &'a [String],
     ) -> Self {
         Self {
             request,
@@ -61,490 +46,125 @@ impl<'a> VariableResolver<'a> {
             tx,
             matched_var,
             matched_vars,
-            captures,
+            logical_matches: None,
+            matched_bytes: None,
+            request_line: None,
+            // Standalone resolver inputs supply their public numeric fields directly.
+            connector_metadata: ConnectorMetadata {
+                request_line: true,
+                client_port: true,
+                server_port: true,
+                response_status: true,
+                source_qualified_arguments: false,
+            },
         }
+    }
+
+    pub(crate) fn with_request_line(mut self, line: &'a OnceLock<Box<[u8]>>) -> Self {
+        self.request_line = Some(line);
+        self
+    }
+
+    pub(crate) fn with_connector_metadata(mut self, metadata: ConnectorMetadata) -> Self {
+        self.connector_metadata = metadata;
+        self
     }
 
     /// Resolve a variable specification to values.
     pub fn resolve(&self, spec: &VariableSpec) -> Vec<(String, String)> {
-        let values = self.resolve_variable(spec.name, &spec.selection);
-
-        // Apply exclusions
-        if spec.exclusions.is_empty() {
-            values
-        } else {
-            values
-                .into_iter()
-                .filter(|(k, _)| !spec.exclusions.iter().any(|e| exclusion_matches(k, e)))
-                .collect()
-        }
-    }
-
-    /// Resolve a variable by name.
-    fn resolve_variable(
-        &self,
-        name: VariableName,
-        selection: &Option<Selection>,
-    ) -> Vec<(String, String)> {
-        match name {
-            // Request variables
-            VariableName::RequestUri => {
-                vec![("REQUEST_URI".to_string(), self.request.uri.clone())]
-            }
-            VariableName::RequestUriRaw => {
-                vec![("REQUEST_URI_RAW".to_string(), self.request.uri_raw.clone())]
-            }
-            VariableName::RequestMethod => {
-                vec![("REQUEST_METHOD".to_string(), self.request.method.clone())]
-            }
-            VariableName::RequestProtocol => {
-                vec![(
-                    "REQUEST_PROTOCOL".to_string(),
-                    self.request.protocol.clone(),
-                )]
-            }
-            VariableName::QueryString => {
-                vec![(
-                    "QUERY_STRING".to_string(),
-                    self.request.query_string.clone(),
-                )]
-            }
-            VariableName::RequestFilename => {
-                vec![("REQUEST_FILENAME".to_string(), self.request.path.clone())]
-            }
-            VariableName::RequestLine => {
-                // The request line as it arrived. CRS 920100 tests this with a
-                // negated regex, so leaving it unresolved made that rule match
-                // every request rather than none.
-                let uri = if self.request.uri_raw.is_empty() {
-                    &self.request.uri
-                } else {
-                    &self.request.uri_raw
-                };
-                vec![(
-                    "REQUEST_LINE".to_string(),
-                    format!("{} {} {}", self.request.method, uri, self.request.protocol),
-                )]
-            }
-            VariableName::RequestBasename => {
-                // Final path segment. ModSecurity splits on both separators, so
-                // a Windows-style path does not hide the basename.
-                let basename = self
-                    .request
-                    .path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                vec![("REQUEST_BASENAME".to_string(), basename)]
-            }
-            VariableName::ArgsCombinedSize => {
-                use super::collection::Collection;
-                let size: usize = [&self.request.args_get, &self.request.args_post]
-                    .iter()
-                    .flat_map(|c| c.all())
-                    .map(|(name, value)| name.len() + value.len())
-                    .sum();
-                vec![("ARGS_COMBINED_SIZE".to_string(), size.to_string())]
-            }
-            VariableName::RequestBody => {
-                vec![("REQUEST_BODY".to_string(), self.request.body_str())]
-            }
-            VariableName::RequestBodyLength => {
-                vec![(
-                    "REQUEST_BODY_LENGTH".to_string(),
-                    self.request.body_length().to_string(),
-                )]
-            }
-
-            // Collections
-            VariableName::Args => self.resolve_collection_from_all_args(selection),
-            VariableName::ArgsGet => {
-                self.resolve_collection(&self.request.args_get, "ARGS_GET", selection)
-            }
-            VariableName::ArgsPost => {
-                self.resolve_collection(&self.request.args_post, "ARGS_POST", selection)
-            }
-            VariableName::ArgsNames => self.resolve_collection_names(
-                &[&self.request.args_get, &self.request.args_post],
-                "ARGS_NAMES",
-                selection,
-            ),
-            VariableName::ArgsGetNames => self.resolve_collection_names(
-                &[&self.request.args_get],
-                "ARGS_GET_NAMES",
-                selection,
-            ),
-            VariableName::ArgsPostNames => self.resolve_collection_names(
-                &[&self.request.args_post],
-                "ARGS_POST_NAMES",
-                selection,
-            ),
-            VariableName::RequestHeaders => {
-                self.resolve_collection_ci(&self.request.headers, "REQUEST_HEADERS", selection)
-            }
-            VariableName::RequestHeadersNames => self.resolve_collection_names(
-                &[&self.request.headers],
-                "REQUEST_HEADERS_NAMES",
-                selection,
-            ),
-            VariableName::RequestCookies => {
-                self.resolve_collection(&self.request.cookies, "REQUEST_COOKIES", selection)
-            }
-            VariableName::RequestCookiesNames => self.resolve_collection_names(
-                &[&self.request.cookies],
-                "REQUEST_COOKIES_NAMES",
-                selection,
-            ),
-
-            // Multipart body processor results
-            VariableName::MultipartPartHeaders => self.resolve_collection(
-                &self.request.multipart_part_headers,
-                "MULTIPART_PART_HEADERS",
-                selection,
-            ),
-            VariableName::Files => self.resolve_collection(&self.request.files, "FILES", selection),
-            VariableName::FilesNames => {
-                self.resolve_collection_names(&[&self.request.files], "FILES_NAMES", selection)
-            }
-            VariableName::ReqBodyProcessor => {
-                if self.request.body_processor.is_empty() {
-                    vec![]
-                } else {
-                    vec![(
-                        "REQBODY_PROCESSOR".to_string(),
-                        self.request.body_processor.clone(),
-                    )]
-                }
-            }
-
-            // A body the processor could not handle. These resolved to nothing
-            // before, so CRS rule 200002 (`SecRule REQBODY_ERROR "!@eq 0"`)
-            // could never fire and a rejected body passed unexamined and
-            // unreported.
-            //
-            // REQBODY_ERROR always has a value -- "0" when the body processed
-            // cleanly -- because a rule comparing it against 0 must be able to
-            // find it. REQBODY_ERROR_MSG is absent unless there is a message,
-            // matching ModSecurity.
-            VariableName::ReqBodyError | VariableName::ReqBodyProcessorError => {
-                let flag = if self.request.body_error.is_some() {
-                    "1"
-                } else {
-                    "0"
-                };
-                vec![("REQBODY_ERROR".to_string(), flag.to_string())]
-            }
-            VariableName::ReqBodyErrorMsg | VariableName::ReqBodyProcessorErrorMsg => {
-                match &self.request.body_error {
-                    Some(msg) => vec![("REQBODY_ERROR_MSG".to_string(), msg.clone())],
-                    None => vec![],
-                }
-            }
-
-            // Response variables
-            VariableName::ResponseStatus => {
-                vec![(
-                    "RESPONSE_STATUS".to_string(),
-                    self.response.status.to_string(),
-                )]
-            }
-            VariableName::ResponseBody => {
-                vec![("RESPONSE_BODY".to_string(), self.response.body_str())]
-            }
-            VariableName::ResponseContentType => {
-                vec![(
-                    "RESPONSE_CONTENT_TYPE".to_string(),
-                    self.response.content_type.clone(),
-                )]
-            }
-            VariableName::ResponseHeaders => {
-                self.resolve_collection_ci(&self.response.headers, "RESPONSE_HEADERS", selection)
-            }
-
-            // TX collection
-            VariableName::Xml => self.resolve_xml(selection),
-
-            VariableName::Tx => self.resolve_tx_collection(selection),
-
-            // Client/Server info
-            VariableName::RemoteAddr => {
-                vec![("REMOTE_ADDR".to_string(), self.request.client_ip.clone())]
-            }
-            VariableName::RemotePort => {
-                vec![(
-                    "REMOTE_PORT".to_string(),
-                    self.request.client_port.to_string(),
-                )]
-            }
-            VariableName::ServerName => {
-                vec![("SERVER_NAME".to_string(), self.request.server_name.clone())]
-            }
-            VariableName::ServerAddr => {
-                vec![("SERVER_ADDR".to_string(), self.request.server_addr.clone())]
-            }
-            VariableName::ServerPort => {
-                vec![(
-                    "SERVER_PORT".to_string(),
-                    self.request.server_port.to_string(),
-                )]
-            }
-
-            // Matched variables
-            VariableName::MatchedVar => {
-                if let Some(v) = self.matched_var {
-                    vec![("MATCHED_VAR".to_string(), v.to_string())]
-                } else {
-                    vec![]
-                }
-            }
-            VariableName::MatchedVars => self
-                .matched_vars
-                .iter()
-                .map(|(k, v)| (format!("MATCHED_VARS:{}", k), v.clone()))
-                .collect(),
-            VariableName::MatchedVarName => match self.matched_vars.last() {
-                Some((name, _)) => vec![("MATCHED_VAR_NAME".to_string(), name.clone())],
-                None => vec![],
-            },
-            VariableName::MatchedVarsNames => self
-                .matched_vars
-                .iter()
-                .map(|(k, _)| (format!("MATCHED_VARS_NAMES:{}", k), k.clone()))
-                .collect(),
-
-            // Default - empty
-            _ => vec![],
-        }
-    }
-
-    /// Resolve a collection with optional selection.
-    fn resolve_collection(
-        &self,
-        collection: &super::collection::HashMapCollection,
-        prefix: &str,
-        selection: &Option<Selection>,
-    ) -> Vec<(String, String)> {
-        self.resolve_collection_inner(collection, prefix, selection, false)
-    }
-
-    /// Resolve a collection where keys are matched case-insensitively (HTTP headers).
-    fn resolve_collection_ci(
-        &self,
-        collection: &super::collection::HashMapCollection,
-        prefix: &str,
-        selection: &Option<Selection>,
-    ) -> Vec<(String, String)> {
-        self.resolve_collection_inner(collection, prefix, selection, true)
-    }
-
-    fn resolve_collection_inner(
-        &self,
-        collection: &super::collection::HashMapCollection,
-        prefix: &str,
-        selection: &Option<Selection>,
-        lowercase_key: bool,
-    ) -> Vec<(String, String)> {
-        use super::collection::Collection;
-
-        match selection {
-            Some(Selection::Key(key)) => {
-                let lookup = if lowercase_key {
-                    key.to_ascii_lowercase()
-                } else {
-                    key.clone()
-                };
-                if let Some(values) = collection.get(&lookup) {
-                    values
-                        .into_iter()
-                        .map(|v| (format!("{}:{}", prefix, key), v.to_string()))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            }
-            Some(Selection::Regex(pattern)) => {
-                if let Some(re) = cached_regex(pattern) {
-                    collection
-                        .get_regex(&re)
-                        .into_iter()
-                        .map(|(k, v)| (format!("{}:{}", prefix, k), v.to_string()))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            }
-            None => collection
-                .all()
-                .into_iter()
-                .map(|(k, v)| (format!("{}:{}", prefix, k), v.to_string()))
-                .collect(),
-        }
-    }
-
-    /// Resolve ARGS collection (GET + POST combined).
-    /// Resolve an `XML:` target against the flattened XML body.
-    ///
-    /// The XML body processor flattens element text to `xml.<path>` and
-    /// attributes to `xml.<path>.@<name>` in `ARGS`. `XML:/*` and `XML://@*`
-    /// are exactly those two sets, so they are answered from the flattening
-    /// rather than by evaluating XPath.
-    ///
-    /// Values are reported under their XPath-style name -- `xml.order.item.@id`
-    /// is reported as `XML:/order/item/@id` -- so `%{MATCHED_VAR_NAME}` in a
-    /// rule's `logdata` names the node the way the rule addressed it.
-    fn resolve_xml(&self, selection: &Option<Selection>) -> Vec<(String, String)> {
-        use super::collection::Collection;
-
-        let Some(target) = XmlTarget::from_selection(selection.as_ref()) else {
-            // An XPath expression this engine cannot express. Reported when the
-            // rules load, so there is nothing to say per request.
-            return vec![];
-        };
-
-        self.request
-            .args_post
-            .all()
+        self.resolve_bytes(spec)
             .into_iter()
-            .filter_map(|(name, value)| {
-                let path = name.strip_prefix("xml.")?;
-                // An XML element name cannot begin with `@`, so `.@` only ever
-                // marks the attribute segment this processor appends.
-                let is_attribute = path.contains(".@");
-                let wanted = match target {
-                    XmlTarget::Elements => !is_attribute,
-                    XmlTarget::Attributes => is_attribute,
-                    XmlTarget::All => true,
-                };
-                if !wanted {
-                    return None;
-                }
-                Some((
-                    format!("XML:/{}", path.replace('.', "/")),
-                    value.to_string(),
-                ))
-            })
+            .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
-    }
-
-    fn resolve_collection_from_all_args(
-        &self,
-        selection: &Option<Selection>,
-    ) -> Vec<(String, String)> {
-        let mut result = self.resolve_collection(&self.request.args_get, "ARGS", selection);
-        result.extend(self.resolve_collection(&self.request.args_post, "ARGS", selection));
-        result
-    }
-
-    /// Resolve a `*_NAMES` collection: the values are the keys of the backing
-    /// collection(s), one entry per stored value (duplicates preserved,
-    /// matching ModSecurity).
-    fn resolve_collection_names(
-        &self,
-        collections: &[&super::collection::HashMapCollection],
-        prefix: &str,
-        selection: &Option<Selection>,
-    ) -> Vec<(String, String)> {
-        use super::collection::Collection;
-
-        let mut result = Vec::new();
-        for collection in collections {
-            for (key, _) in collection.all() {
-                let selected = match selection {
-                    Some(Selection::Key(sel)) => key.eq_ignore_ascii_case(sel),
-                    Some(Selection::Regex(pattern)) => cached_regex(pattern)
-                        .map(|re| re.is_match(key))
-                        .unwrap_or(false),
-                    None => true,
-                };
-                if selected {
-                    result.push((format!("{}:{}", prefix, key), key.to_string()));
-                }
-            }
-        }
-        result
-    }
-
-    /// Resolve TX collection.
-    fn resolve_tx_collection(&self, selection: &Option<Selection>) -> Vec<(String, String)> {
-        use super::collection::Collection;
-
-        match selection {
-            Some(Selection::Key(key)) => {
-                if let Some(values) = self.tx.get(key) {
-                    values
-                        .into_iter()
-                        .map(|v| (format!("TX:{}", key), v.to_string()))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            }
-            Some(Selection::Regex(pattern)) => {
-                if let Some(re) = cached_regex(pattern) {
-                    self.tx
-                        .get_regex(&re)
-                        .into_iter()
-                        .map(|(k, v)| (format!("TX:{}", k), v.to_string()))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            }
-            None => self
-                .tx
-                .all()
-                .into_iter()
-                .map(|(k, v)| (format!("TX:{}", k), v.to_string()))
-                .collect(),
-        }
-    }
-}
-
-/// Check whether a resolved variable key (e.g. `ARGS:password`) is excluded by
-/// a target exclusion (`!TARGET` in a rule's variable list or in
-/// `SecRuleUpdateTargetById`).
-///
-/// Supported exclusion forms, per ModSecurity:
-/// - `COLLECTION:key` — excludes that member (key compared case-insensitively);
-/// - `COLLECTION:/regex/` — excludes members whose key matches the regex;
-/// - `COLLECTION` — excludes the entire collection.
-fn exclusion_matches(key: &str, exclusion: &str) -> bool {
-    match exclusion.split_once(':') {
-        Some((excl_coll, excl_sel)) => {
-            let Some((key_coll, key_member)) = key.split_once(':') else {
-                return false;
-            };
-            if !key_coll.eq_ignore_ascii_case(excl_coll) {
-                return false;
-            }
-            if excl_sel.len() > 2 && excl_sel.starts_with('/') && excl_sel.ends_with('/') {
-                cached_regex(&excl_sel[1..excl_sel.len() - 1])
-                    .map(|re| re.is_match(key_member))
-                    .unwrap_or(false)
-            } else {
-                key_member.eq_ignore_ascii_case(excl_sel)
-            }
-        }
-        None => {
-            let key_coll = key.split_once(':').map(|(c, _)| c).unwrap_or(key);
-            key_coll.eq_ignore_ascii_case(exclusion)
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_regex, exclusion_matches};
+    use super::*;
+    use crate::parser::parse_single_variable;
 
     #[test]
-    fn test_cached_regex_compiles_once_and_keeps_invalid_patterns_dead() {
-        let a = cached_regex(r"^user_\d+$").expect("valid pattern");
-        let b = cached_regex(r"^user_\d+$").expect("valid pattern");
-        assert!(a.is_match("user_42") && b.is_match("user_42"));
-        // An invalid pattern stays a never-matching selection, cached or not.
-        assert!(cached_regex("(unclosed").is_none());
-        assert!(cached_regex("(unclosed").is_none());
+    fn transaction_clock_uses_local_calendar_and_coraza_formatting() {
+        use chrono::{Local, TimeZone};
+
+        let local = Local
+            .with_ymd_and_hms(2025, 2, 3, 4, 5, 6)
+            .single()
+            .unwrap();
+        let mut request = RequestData::new();
+        request.started = local.into();
+        let response = ResponseData::new();
+        let tx = TxCollection::new();
+        let resolver = VariableResolver::new(&request, &response, &tx, None, &[], &[]);
+        let epoch = local.timestamp().to_string();
+        for (name, expected) in [
+            ("TIME", "04:05:06"),
+            ("TIME_HOUR", "04"),
+            ("TIME_MIN", "05"),
+            ("TIME_SEC", "06"),
+            ("TIME_YEAR", "2025"),
+            ("TIME_MON", "2"),
+            ("TIME_DAY", "3"),
+            ("TIME_WDAY", "1"),
+            ("TIME_EPOCH", &epoch),
+            ("DURATION", "0"),
+        ] {
+            assert_eq!(
+                resolver.resolve(&parse_single_variable(name).unwrap())[0].1,
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_line_cache_retains_only_complete_lines_within_its_bound() {
+        let response = ResponseData::new();
+        let tx = TxCollection::new();
+        let spec = parse_single_variable("REQUEST_LINE").unwrap();
+        let limit = byte_resolution::MAX_CACHED_REQUEST_LINE;
+        for len in [limit - 1, limit, limit + 1] {
+            let mut request = RequestData::new();
+            request.method = "M".into();
+            request.protocol = "P".into();
+            request.uri_raw = "x".repeat(len - 4);
+            let line = format!("M {} P", request.uri_raw);
+            let cache = OnceLock::new();
+            for _ in 0..2 {
+                let values = VariableResolver::new(&request, &response, &tx, None, &[], &[])
+                    .with_request_line(&cache)
+                    .resolve(&spec);
+                assert_eq!(values[0].1, line);
+            }
+            assert_eq!(cache.get().is_some(), len <= limit);
+
+            request.uri_raw = "/updated".into();
+            let direct = VariableResolver::new(&request, &response, &tx, None, &[], &[]);
+            assert_eq!(direct.resolve(&spec)[0].1, "M /updated P");
+        }
+    }
+
+    fn exclusion_matches(name: &str, target: &str) -> bool {
+        let (collection, key) = name.split_once(':').unwrap();
+        let mut request = RequestData::new();
+        let map = if collection == "REQUEST_COOKIES" {
+            &mut request.cookies
+        } else {
+            &mut request.args_get
+        };
+        map.add(key.into(), "sample".into());
+        let mut spec = parse_single_variable(collection).unwrap();
+        spec.exclusions.push(target.to_owned());
+        let response = ResponseData::new();
+        let tx = TxCollection::new();
+        VariableResolver::new(&request, &response, &tx, None, &[], &[])
+            .resolve(&spec)
+            .is_empty()
+    }
+
+    #[test]
+    fn invalid_regex_exclusion_leaves_the_member_selected() {
         assert!(!exclusion_matches("ARGS:x", "ARGS:/(unclosed/"));
     }
 
